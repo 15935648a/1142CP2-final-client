@@ -127,8 +127,10 @@ class ArenaBot:
     def leave(self):
         self._stop.set()
         try:
-            self._post(f"/api/rooms/{ROOM_ID}/leave",
-                       params={"presence_id": self.presence_id})
+            r = self.session.delete(
+                f"{ARENA_URL}/api/rooms/{ROOM_ID}/presence/{self.presence_id}")
+            if not r.ok:
+                log.warning(f"DELETE presence → {r.status_code}: {r.text[:200]}")
         except Exception:
             pass
         log.info("Left room")
