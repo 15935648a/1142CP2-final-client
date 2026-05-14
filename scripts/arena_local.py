@@ -1,0 +1,137 @@
+#!/usr/bin/env python3
+"""
+Local arena: pit two MCTS configs against each other without a server.
+
+Usage:
+    python scripts/arena_local.py [--games 20] [--budget 5.0] [--sims 400]
+
+  --budget   think seconds for "budget" player  (default 5.0)
+  --sims     fixed sim count for "fixed" player (default 400)
+  --games    total games to play                (default 20)
+
+Players alternate colors each game.
+"""
+import argparse
+import sys
+import time
+import os
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+
+import torch
+import numpy as np
+
+from connect6s.config import Config
+from connect6s.game import GameState
+from connect6s.mcts import MCTS
+from connect6s.network import build_net
+
+torch.set_num_threads(2)
+torch.set_num_interop_threads(1)
+
+
+def build_mcts(net, cfg, num_simulations):
+    return MCTS(
+        net,
+        num_simulations = num_simulations,
+        c_puct          = cfg.C_PUCT,
+        dirichlet_alpha = cfg.DIRICHLET_ALPHA,
+        dirichlet_eps   = 0.0,
+        leaf_batch_size = cfg.LEAF_BATCH_SIZE,
+    )
+
+
+def play_game(mcts_black, mcts_white, budget_black, budget_white, max_moves=500):
+    """Play one game. Returns winner: 1=black, 2=white, 0=draw."""
+    state = GameState()
+    mcts_map  = {1: mcts_black, 2: mcts_white}
+    budget_map = {1: budget_black, 2: budget_white}
+    move_no = 0
+
+    while not state.game_over and move_no < max_moves:
+        cp      = state.current_player          # 1=black, -1=white
+        player  = 1 if cp == 1 else 2
+        mcts    = mcts_map[player]
+        budget  = budget_map[player]
+
+        mcts.clear_cache()
+        if budget is not None:
+            probs = mcts.get_action_probs_timed(state, seconds=budget, add_noise=False)
+        else:
+            probs = mcts.get_action_probs(state, temperature=0.0, add_noise=False)
+
+        idx         = int(np.argmax(probs))
+        row, col, s = state.index_to_action(idx)
+        state       = state.make_move(row, col, s)
+        move_no    += 1
+
+    if state.game_over:
+        return state.winner   # 1 or 2
+    return 0                  # draw / timeout
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--games",  type=int,   default=20)
+    parser.add_argument("--budget", type=float, default=5.0,
+                        help="Think seconds for budget player")
+    parser.add_argument("--sims",   type=int,   default=400,
+                        help="Fixed sim count for fixed player")
+    args = parser.parse_args()
+
+    cfg    = Config()
+    device = torch.device("cpu")
+    net    = build_net(cfg.NUM_RES_BLOCKS, cfg.NUM_CHANNELS, device=device)
+
+    ckpt = torch.load(cfg.BEST_MODEL_PATH, map_location=device)
+    sd   = ckpt["model"] if isinstance(ckpt, dict) and "model" in ckpt else ckpt
+    net.load_state_dict(sd)
+    net.eval()
+    print(f"Loaded {cfg.BEST_MODEL_PATH}")
+
+    # Both players share the same network weights
+    mcts_budget = build_mcts(net, cfg, num_simulations=10_000_000)
+    mcts_fixed  = build_mcts(net, cfg, num_simulations=args.sims)
+
+    print(f"\nBudget({args.budget}s) vs Fixed({args.sims}sims)  —  {args.games} games\n")
+
+    wins = {"budget": 0, "fixed": 0, "draw": 0}
+
+    for g in range(args.games):
+        # Alternate colors each game
+        if g % 2 == 0:
+            b_player, w_player = "budget", "fixed"
+            mb, mw = mcts_budget, mcts_fixed
+            bb, bw = args.budget, None
+        else:
+            b_player, w_player = "fixed", "budget"
+            mb, mw = mcts_fixed, mcts_budget
+            bb, bw = None, args.budget
+
+        t0     = time.time()
+        winner = play_game(mb, mw, bb, bw)
+        elapsed = time.time() - t0
+
+        if winner == 1:
+            wins[b_player] += 1
+            result = f"Black({b_player}) wins"
+        elif winner == -1:
+            wins[w_player] += 1
+            result = f"White({w_player}) wins"
+        else:
+            wins["draw"] += 1
+            result = "Draw"
+
+        print(f"Game {g+1:3d}/{args.games}  {result:30s}  {elapsed:.0f}s")
+
+    total = args.games - wins["draw"]
+    print(f"\n{'='*50}")
+    print(f"budget({args.budget}s): {wins['budget']} wins")
+    print(f"fixed({args.sims}):     {wins['fixed']} wins")
+    print(f"draws:           {wins['draw']}")
+    if total > 0:
+        print(f"budget win rate: {wins['budget']/total*100:.1f}% (excl. draws)")
+
+
+if __name__ == "__main__":
+    main()
