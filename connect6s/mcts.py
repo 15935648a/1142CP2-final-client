@@ -252,8 +252,12 @@ class MCTS:
                                add_noise=True) -> np.ndarray:
         """Run MCTS for up to `seconds` wall-clock seconds, then return greedy probs."""
         deadline = time.time() + seconds
-        counts   = self.run(state, add_noise=add_noise, deadline=deadline)
-        probs    = np.zeros_like(counts)
+        saved, self.num_simulations = self.num_simulations, 10_000_000
+        try:
+            counts = self.run(state, add_noise=add_noise, deadline=deadline)
+        finally:
+            self.num_simulations = saved
+        probs = np.zeros_like(counts)
         probs[np.argmax(counts)] = 1.0
         return probs
 

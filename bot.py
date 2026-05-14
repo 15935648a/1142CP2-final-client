@@ -230,6 +230,7 @@ class ArenaBot:
                 move_no   = room.get("move_count", 0)
                 move_key  = f"{game_id}:{move_no}"
                 time_left = float((room.get("player_time_left") or {}).get(pid, 0.0) or 0.0)
+                log.info(f"time_left={time_left:.1f}s")
                 self._pick_and_send(move_key, time_left)
 
         # Bid phase
