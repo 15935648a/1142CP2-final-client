@@ -38,7 +38,7 @@ from connect6s.network import build_net
 ARENA_URL   = os.environ.get("ARENA_URL", "http://arena-api-server:8080").rstrip("/")
 BOT_API_KEY = os.environ.get("BOT_API_KEY", "")
 ROOM_ID     = os.environ.get("ROOM_ID", "")
-BOT_SIMS    = int(os.environ.get("BOT_SIMS", "150"))
+BOT_SIMS    = int(os.environ.get("BOT_SIMS", "0"))   # 0 = use time budget
 BID_VALUE   = float(os.environ.get("BOT_BID_VALUE", "30.0"))
 BID_COLOR   = os.environ.get("BOT_BID_COLOR", "black")
 
@@ -167,14 +167,20 @@ class ArenaBot:
             return
         self._last_move_key = move_key
         self.mcts.clear_cache()
-        budget = self._time_budget(time_left, move_no) if time_left > 0 else None
-        t0     = time.time()
-        if budget:
+        t0 = time.time()
+        if BOT_SIMS > 0:
+            # fixed-sims mode (override from env)
+            probs = self.mcts.get_action_probs(
+                self.game_state, temperature=0.0, add_noise=False
+            )
+        elif time_left > 0:
+            budget = self._time_budget(time_left, move_no)
             log.info(f"Thinking for {budget:.1f}s (bank={time_left:.1f}s move={move_no})")
             probs = self.mcts.get_action_probs_timed(
                 self.game_state, seconds=budget, add_noise=False
             )
         else:
+            # no time info (sandbox inject) — fallback fixed sims
             probs = self.mcts.get_action_probs(
                 self.game_state, temperature=0.0, add_noise=False
             )
@@ -301,7 +307,7 @@ def main():
     net.eval()
     mcts = MCTS(
         net,
-        num_simulations  = BOT_SIMS,
+        num_simulations  = BOT_SIMS if BOT_SIMS > 0 else 200,  # fallback for time-budget mode
         c_puct           = cfg.C_PUCT,
         dirichlet_alpha  = cfg.DIRICHLET_ALPHA,
         dirichlet_eps    = 0.0,
