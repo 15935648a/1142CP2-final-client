@@ -1,0 +1,19 @@
+.env
+.venv/
+.omc/
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+
+# Training artifacts (large, not needed for submission)
+data/
+logs/
+build/
+
+# Documentation PDFs (not needed for bot to run)
+*.pdf
+
+# Only keep best.pt; exclude all other checkpoints
+models/*.pt
+!models/best.pt
