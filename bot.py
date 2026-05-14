@@ -152,7 +152,13 @@ class ArenaBot:
         log.info(f"Bid value={value} color={color}")
 
     # ── MCTS decision ─────────────────────────────────────────────────────────
-    def _pick_and_send(self, move_key: str):
+    def _time_budget(self, time_left: float) -> float:
+        """Fraction of remaining bank to spend, keeping a safety reserve."""
+        usable = max(time_left - 10.0, 0.0)   # reserve 10 s
+        budget = min(usable * 0.20, 20.0)      # up to 20% of usable, max 20 s
+        return max(budget, 1.0)                # always think at least 1 s
+
+    def _pick_and_send(self, move_key: str, time_left: float = 0.0):
         if move_key == self._last_move_key:
             return
         if self.game_state is None or self.game_state.game_over:
@@ -160,10 +166,17 @@ class ArenaBot:
             return
         self._last_move_key = move_key
         self.mcts.clear_cache()
-        t0    = time.time()
-        probs = self.mcts.get_action_probs(
-            self.game_state, temperature=0.0, add_noise=False
-        )
+        budget = self._time_budget(time_left) if time_left > 0 else None
+        t0     = time.time()
+        if budget:
+            log.info(f"Thinking for {budget:.1f}s (bank={time_left:.1f}s)")
+            probs = self.mcts.get_action_probs_timed(
+                self.game_state, seconds=budget, add_noise=False
+            )
+        else:
+            probs = self.mcts.get_action_probs(
+                self.game_state, temperature=0.0, add_noise=False
+            )
         log.info(f"MCTS done in {time.time() - t0:.2f}s")
         idx         = int(np.argmax(probs))
         row, col, s = self.game_state.index_to_action(idx)
@@ -213,10 +226,11 @@ class ArenaBot:
         if room.get("awaiting_move") and self.game_state:
             turn = room.get("turn_info") or {}
             if turn.get("player_id") == self.my_player_id:
-                game_id  = room.get("current_game_id", "")
-                move_no  = room.get("move_count", 0)
-                move_key = f"{game_id}:{move_no}"
-                self._pick_and_send(move_key)
+                game_id   = room.get("current_game_id", "")
+                move_no   = room.get("move_count", 0)
+                move_key  = f"{game_id}:{move_no}"
+                time_left = float((room.get("player_time_left") or {}).get(pid, 0.0) or 0.0)
+                self._pick_and_send(move_key, time_left)
 
         # Bid phase
         if room.get("awaiting_bid"):
@@ -228,7 +242,10 @@ class ArenaBot:
                     bid_key  = f"{game_id}:{deadline}"
                     if bid_key != self._last_bid_key:
                         self._last_bid_key = bid_key
-                        self._bid(BID_VALUE, BID_COLOR)
+                        my_info  = (bid_req.get("players") or {}).get(str(self.my_player_id), {})
+                        max_bid  = float(my_info.get("max_bid") or 120.0)
+                        safe_bid = min(BID_VALUE, max_bid)
+                        self._bid(safe_bid, BID_COLOR)
 
     # ── SSE stream loop ───────────────────────────────────────────────────────
     def _stream_loop(self):

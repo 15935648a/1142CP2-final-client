@@ -10,6 +10,7 @@ to move AT that node. UCB uses q = -child.mean_value (opponent flip).
 Backprop negates value at every edge going up the tree.
 """
 import math
+import time
 import numpy as np
 from .game import GameState, ACTION_SIZE, BOARD_SIZE
 
@@ -163,10 +164,10 @@ class MCTS:
             child.prior = (1 - self.dirichlet_eps) * child.prior + self.dirichlet_eps * n
 
     # ------------------------------------------------------------------
-    def run(self, state: GameState, add_noise=True) -> np.ndarray:
+    def run(self, state: GameState, add_noise=True, deadline: float | None = None) -> np.ndarray:
         """
         Run MCTS and return visit-count vector of shape [ACTION_SIZE].
-        Uses batched leaf evaluation for GPU efficiency.
+        If deadline is set (epoch seconds), stop when time is reached regardless of sim count.
         """
         root = MCTSNode(state)
         self._ensure_cached(root)
@@ -176,7 +177,7 @@ class MCTS:
         done = 0
         B    = self.leaf_batch_size
 
-        while done < self.num_simulations:
+        while done < self.num_simulations and (deadline is None or time.time() < deadline):
             batch = min(B, self.num_simulations - done)
 
             # ── SELECT (with virtual loss) ────────────────────────────
@@ -247,6 +248,15 @@ class MCTS:
         return counts
 
     # ------------------------------------------------------------------
+    def get_action_probs_timed(self, state: GameState, seconds: float,
+                               add_noise=True) -> np.ndarray:
+        """Run MCTS for up to `seconds` wall-clock seconds, then return greedy probs."""
+        deadline = time.time() + seconds
+        counts   = self.run(state, add_noise=add_noise, deadline=deadline)
+        probs    = np.zeros_like(counts)
+        probs[np.argmax(counts)] = 1.0
+        return probs
+
     def get_action_probs(self, state: GameState, temperature=1.0,
                          add_noise=True) -> np.ndarray:
         counts = self.run(state, add_noise=add_noise)
