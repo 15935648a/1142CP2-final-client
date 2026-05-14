@@ -1,0 +1,7 @@
+{
+  "runtime": "python",
+  "python_version": "3.11",
+  "entrypoint": "bot.py",
+  "install_command": "pip install -r requirements.txt",
+  "pull_only": true
+}
