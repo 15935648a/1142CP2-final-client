@@ -152,13 +152,14 @@ class ArenaBot:
         log.info(f"Bid value={value} color={color}")
 
     # ── MCTS decision ─────────────────────────────────────────────────────────
-    def _time_budget(self, time_left: float) -> float:
-        """Fraction of remaining bank to spend, keeping a safety reserve."""
-        usable = max(time_left - 10.0, 0.0)   # reserve 10 s
-        budget = min(usable * 0.20, 20.0)      # up to 20% of usable, max 20 s
-        return max(budget, 1.0)                # always think at least 1 s
+    def _time_budget(self, time_left: float, move_no: int = 0) -> float:
+        """Spend more time in midgame/endgame, less in opening."""
+        fraction = min(0.10 + move_no * 0.005, 0.30)  # 10% → 30% over 40 moves
+        usable   = max(time_left - 10.0, 0.0)
+        budget   = min(usable * fraction, 20.0)
+        return max(budget, 1.0)
 
-    def _pick_and_send(self, move_key: str, time_left: float = 0.0):
+    def _pick_and_send(self, move_key: str, time_left: float = 0.0, move_no: int = 0):
         if move_key == self._last_move_key:
             return
         if self.game_state is None or self.game_state.game_over:
@@ -166,10 +167,10 @@ class ArenaBot:
             return
         self._last_move_key = move_key
         self.mcts.clear_cache()
-        budget = self._time_budget(time_left) if time_left > 0 else None
+        budget = self._time_budget(time_left, move_no) if time_left > 0 else None
         t0     = time.time()
         if budget:
-            log.info(f"Thinking for {budget:.1f}s (bank={time_left:.1f}s)")
+            log.info(f"Thinking for {budget:.1f}s (bank={time_left:.1f}s move={move_no})")
             probs = self.mcts.get_action_probs_timed(
                 self.game_state, seconds=budget, add_noise=False
             )
@@ -230,8 +231,7 @@ class ArenaBot:
                 move_no   = room.get("move_count", 0)
                 move_key  = f"{game_id}:{move_no}"
                 time_left = float((room.get("player_time_left") or {}).get(pid, 0.0) or 0.0)
-                log.info(f"time_left={time_left:.1f}s")
-                self._pick_and_send(move_key, time_left)
+                self._pick_and_send(move_key, time_left, move_no)
 
         # Bid phase
         if room.get("awaiting_bid"):
