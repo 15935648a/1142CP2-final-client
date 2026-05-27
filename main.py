@@ -10,6 +10,7 @@ Usage:
   python main.py bench             # benchmark: MCTS agent vs random
 """
 import argparse
+import glob
 import os
 import copy
 import torch
@@ -47,6 +48,15 @@ def _load_net(cfg: Config):
 
 # ── Commands ──────────────────────────────────────────────────────────────────
 
+def _update_pool(pool: list, path: str, max_size: int) -> list:
+    """Add path to pool; trim oldest beyond max_size."""
+    if path not in pool:
+        pool.append(path)
+    if len(pool) > max_size:
+        pool = pool[-max_size:]
+    return pool
+
+
 def cmd_train(cfg: Config, iterations: int):
     os.makedirs(cfg.MODEL_DIR, exist_ok=True)
     _print_device_info(cfg)
@@ -56,7 +66,14 @@ def cmd_train(cfg: Config, iterations: int):
     if os.path.exists(cfg.BEST_MODEL_PATH):
         trainer.load(cfg.BEST_MODEL_PATH, load_optimizer=True)
 
-    EVAL_SIMS = max(cfg.NUM_SIMULATIONS // 2, 50)
+    EVAL_SIMS  = max(cfg.NUM_SIMULATIONS // 2, 50)
+    pool_size  = getattr(cfg, "OPPONENT_POOL_SIZE", 8)
+    pool_ratio = getattr(cfg, "OPPONENT_POOL_RATIO", 0.0)
+
+    # Seed pool from existing iter checkpoints
+    pool_paths = sorted(glob.glob(os.path.join(cfg.MODEL_DIR, "pool_*.pt")))[-pool_size:]
+    if pool_paths:
+        print(f"  Opponent pool: {len(pool_paths)} checkpoints loaded")
 
     for it in range(1, iterations + 1):
         print(f"\n{'='*60}")
@@ -64,11 +81,13 @@ def cmd_train(cfg: Config, iterations: int):
         print(f"{'='*60}")
 
         # 1. Self-play (parallel workers or single-process)
+        opp_info = f", {len(pool_paths)} opp pool" if pool_paths and pool_ratio > 0 else ""
         print(f"\n[Self-play] {cfg.NUM_SELF_PLAY_GAMES} games × {cfg.NUM_SIMULATIONS} sims "
-              f"({cfg.NUM_WORKERS} workers) ...")
+              f"({cfg.NUM_WORKERS} workers{opp_info}) ...")
         if cfg.NUM_WORKERS > 1:
             examples = generate_parallel_self_play(
-                net, cfg, cfg.NUM_SELF_PLAY_GAMES, cfg.NUM_WORKERS)
+                net, cfg, cfg.NUM_SELF_PLAY_GAMES, cfg.NUM_WORKERS,
+                opponent_paths=pool_paths if pool_paths else None)
         else:
             examples = generate_self_play_data(net, cfg, cfg.NUM_SELF_PLAY_GAMES)
         trainer.add_examples(examples)
@@ -101,6 +120,10 @@ def cmd_train(cfg: Config, iterations: int):
             tag = " [forced]" if force and ratio < cfg.WIN_RATIO_THRESHOLD else ""
             print(f"  ✓ Accepted (ratio={ratio:.3f}){tag}")
             trainer.save(cfg.BEST_MODEL_PATH)
+            # Save a pool copy for future opponent diversity
+            pool_path = os.path.join(cfg.MODEL_DIR, f"pool_{it:04d}.pt")
+            trainer.save(pool_path)
+            pool_paths = _update_pool(pool_paths, pool_path, pool_size)
         else:
             print(f"  ✗ Rejected — reloading best ...")
             trainer.load(cfg.BEST_MODEL_PATH)

@@ -16,13 +16,26 @@ class ReplayBuffer:
     def extend(self, examples):
         self.buf.extend(examples)
 
-    def sample(self, batch_size, device):
-        batch     = random.sample(self.buf, min(batch_size, len(self.buf)))
+    def sample(self, batch_size, device, pool=None):
+        if pool is None:
+            pool = list(self.buf)
+        batch = random.sample(pool, min(batch_size, len(pool)))
+        # Support both legacy 3-tuple and new 4-tuple (with is_full flag)
+        if len(batch[0]) == 4:
+            obs, pis, zs, is_full = zip(*batch)
+            return (
+                torch.from_numpy(np.stack(obs)).to(device),
+                torch.from_numpy(np.stack(pis)).to(device),
+                torch.from_numpy(np.array(zs, dtype=np.float32)).to(device),
+                torch.tensor(is_full, dtype=torch.bool).to(device),
+            )
         obs, pis, zs = zip(*batch)
+        n = len(batch)
         return (
             torch.from_numpy(np.stack(obs)).to(device),
             torch.from_numpy(np.stack(pis)).to(device),
             torch.from_numpy(np.array(zs, dtype=np.float32)).to(device),
+            torch.ones(n, dtype=torch.bool).to(device),
         )
 
     def __len__(self):
@@ -50,19 +63,25 @@ class Trainer:
             return None
 
         self.net.train()
-        n_batches = max(1, len(self.replay) // self.cfg.BATCH_SIZE)
-        total_loss = total_v = total_p = 0.0
+        cap = getattr(self.cfg, "BATCHES_PER_EPOCH", None)
+        n_batches = max(1, cap if cap else len(self.replay) // self.cfg.BATCH_SIZE)
+        total_loss = total_v = total_p = total_te = 0.0
+        pool = list(self.replay.buf)
 
         for _ in range(n_batches):
-            obs, pis, zs = self.replay.sample(self.cfg.BATCH_SIZE, self.device)
+            obs, pis, zs, is_full = self.replay.sample(self.cfg.BATCH_SIZE, self.device, pool=pool)
 
             with torch.autocast(device_type=self.device.type,
                                 enabled=self.device.type == "cuda"):
                 logits, v = self.net(obs)
                 v_loss    = F.mse_loss(v.squeeze(-1), zs)
                 log_p     = F.log_softmax(logits, dim=-1)
-                p_loss    = -(pis * log_p).sum(dim=-1).mean()
-                loss      = 2.0 * v_loss + p_loss
+                # Policy loss only on full-search positions (playout cap)
+                if is_full.any():
+                    p_loss = -(pis[is_full] * log_p[is_full]).sum(dim=-1).mean()
+                else:
+                    p_loss = torch.tensor(0.0, device=self.device)
+                loss = self.cfg.VALUE_LOSS_WEIGHT * v_loss + p_loss
 
             self.optimizer.zero_grad()
             self.scaler.scale(loss).backward()
@@ -71,27 +90,38 @@ class Trainer:
             self.scaler.step(self.optimizer)
             self.scaler.update()
 
+            full_pis   = pis[is_full] if is_full.any() else pis
+            target_ent = -(full_pis * torch.log(full_pis + 1e-8)).sum(dim=-1).mean()
             total_loss += loss.item()
             total_v    += v_loss.item()
             total_p    += p_loss.item()
+            total_te   += target_ent.item()
 
         return {
-            "total":  total_loss / n_batches,
-            "value":  total_v    / n_batches,
-            "policy": total_p    / n_batches,
+            "total":         total_loss / n_batches,
+            "value":         total_v    / n_batches,
+            "policy":        total_p    / n_batches,
+            "target_entropy": total_te  / n_batches,
         }
 
     def train(self, num_epochs=None):
+        import time
         n      = num_epochs or self.cfg.NUM_EPOCHS
         losses = []
+        t0 = time.time()
         for epoch in range(n):
             result = self.train_epoch()
             if result:
                 losses.append(result)
+                elapsed = time.time() - t0
                 print(f"  Epoch {epoch+1}/{n}  "
                       f"loss={result['total']:.4f}  "
                       f"v={result['value']:.4f}  "
-                      f"p={result['policy']:.4f}")
+                      f"p={result['policy']:.4f}  "
+                      f"H(target)={result['target_entropy']:.4f}  "
+                      f"t={elapsed:.0f}s")
+        if self.device.type == "cuda":
+            torch.cuda.empty_cache()
         return losses
 
     def step_lr_decay(self):

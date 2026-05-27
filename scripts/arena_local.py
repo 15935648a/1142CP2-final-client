@@ -22,7 +22,9 @@ import torch
 import numpy as np
 
 from connect6s.config import Config
+from connect6s.config_large import ConfigLarge
 from connect6s.game import GameState
+from connect6s.heuristic_agent import HeuristicAgent
 from connect6s.mcts import MCTS
 from connect6s.network import build_net
 
@@ -72,14 +74,18 @@ def play_game(mcts_black, mcts_white, budget_black, budget_white, max_moves=500)
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--games",  type=int,   default=20)
-    parser.add_argument("--budget", type=float, default=5.0,
-                        help="Think seconds for budget player")
-    parser.add_argument("--sims",   type=int,   default=400,
-                        help="Fixed sim count for fixed player")
+    parser.add_argument("--games",     type=int,   default=20)
+    parser.add_argument("--budget",    type=float, default=5.0,
+                        help="Think seconds for MCTS budget player")
+    parser.add_argument("--sims",      type=int,   default=400,
+                        help="Fixed sim count for MCTS fixed player")
+    parser.add_argument("--heuristic", action="store_true",
+                        help="Replace 'fixed' player with HeuristicAgent(depth=4)")
+    parser.add_argument("--large",     action="store_true",
+                        help="Use large model (best_large.pt)")
     args = parser.parse_args()
 
-    cfg    = Config()
+    cfg    = ConfigLarge() if args.large else Config()
     device = torch.device("cpu")
     net    = build_net(cfg.NUM_RES_BLOCKS, cfg.NUM_CHANNELS, device=device)
 
@@ -89,27 +95,33 @@ def main():
     net.eval()
     print(f"Loaded {cfg.BEST_MODEL_PATH}")
 
-    # Both players share the same network weights
     mcts_budget = build_mcts(net, cfg, num_simulations=10_000_000)
-    mcts_fixed  = build_mcts(net, cfg, num_simulations=args.sims)
 
-    print(f"\nBudget({args.budget}s) vs Fixed({args.sims}sims)  —  {args.games} games\n")
+    if args.heuristic:
+        challenger    = HeuristicAgent(depth=4)
+        p2_name       = "heuristic(d4)"
+        p2_budget     = None   # heuristic ignores budget
+        print(f"\nMCTS(budget={args.budget}s) vs Heuristic(depth=4)  —  {args.games} games\n")
+    else:
+        challenger    = build_mcts(net, cfg, num_simulations=args.sims)
+        p2_name       = f"fixed({args.sims})"
+        p2_budget     = None
+        print(f"\nBudget({args.budget}s) vs Fixed({args.sims}sims)  —  {args.games} games\n")
 
-    wins = {"budget": 0, "fixed": 0, "draw": 0}
+    wins = {"budget": 0, "challenger": 0, "draw": 0}
 
     for g in range(args.games):
-        # Alternate colors each game
         if g % 2 == 0:
-            b_player, w_player = "budget", "fixed"
-            mb, mw = mcts_budget, mcts_fixed
-            bb, bw = args.budget, None
+            b_player, w_player = "budget", "challenger"
+            mb, mw = mcts_budget, challenger
+            bb, bw = args.budget, p2_budget
         else:
-            b_player, w_player = "fixed", "budget"
-            mb, mw = mcts_fixed, mcts_budget
-            bb, bw = None, args.budget
+            b_player, w_player = "challenger", "budget"
+            mb, mw = challenger, mcts_budget
+            bb, bw = p2_budget, args.budget
 
-        t0     = time.time()
-        winner = play_game(mb, mw, bb, bw)
+        t0      = time.time()
+        winner  = play_game(mb, mw, bb, bw)
         elapsed = time.time() - t0
 
         if winner == 1:
@@ -122,15 +134,16 @@ def main():
             wins["draw"] += 1
             result = "Draw"
 
-        print(f"Game {g+1:3d}/{args.games}  {result:30s}  {elapsed:.0f}s")
+        print(f"Game {g+1:3d}/{args.games}  {result:40s}  {elapsed:.0f}s")
 
     total = args.games - wins["draw"]
     print(f"\n{'='*50}")
-    print(f"budget({args.budget}s): {wins['budget']} wins")
-    print(f"fixed({args.sims}):     {wins['fixed']} wins")
+    print(f"budget({args.budget}s):  {wins['budget']} wins")
+    print(f"{p2_name}: {wins['challenger']} wins")
     print(f"draws:           {wins['draw']}")
     if total > 0:
-        print(f"budget win rate: {wins['budget']/total*100:.1f}% (excl. draws)")
+        print(f"MCTS win rate:       {wins['budget']/total*100:.1f}% (excl. draws)")
+        print(f"Challenger win rate: {wins['challenger']/total*100:.1f}% (excl. draws)")
 
 
 if __name__ == "__main__":

@@ -30,7 +30,10 @@ os.environ.setdefault("OMP_NUM_THREADS", "2")
 os.environ.setdefault("MKL_NUM_THREADS", "2")
 
 from connect6s.config import Config
+from connect6s.config_large import ConfigLarge
 from connect6s.game import GameState
+from connect6s.heuristic import find_forced_move
+from connect6s.heuristic_agent import HeuristicAgent
 from connect6s.mcts import MCTS
 from connect6s.network import build_net
 
@@ -38,7 +41,9 @@ from connect6s.network import build_net
 ARENA_URL   = os.environ.get("ARENA_URL", "http://arena-api-server:8080").rstrip("/")
 BOT_API_KEY = os.environ.get("BOT_API_KEY", "")
 ROOM_ID     = os.environ.get("ROOM_ID", "")
-BOT_SIMS    = int(os.environ.get("BOT_SIMS", "0"))   # 0 = use time budget
+BOT_HEURISTIC = bool(os.environ.get("BOT_HEURISTIC", ""))  # use alpha-beta instead of MCTS
+BOT_SIMS      = 0 if BOT_HEURISTIC else int(os.environ.get("BOT_SIMS", "0"))  # heuristic always timed
+BOT_COLOR     = os.environ.get("BOT_COLOR", "").lower()    # "black" or "white", empty = any
 BID_VALUE   = float(os.environ.get("BOT_BID_VALUE", "30.0"))
 BID_COLOR   = os.environ.get("BOT_BID_COLOR", "black")
 
@@ -127,6 +132,10 @@ class ArenaBot:
     def leave(self):
         self._stop.set()
         try:
+            self._post(f"/api/rooms/{ROOM_ID}/seat", {"seat": "spectator"})
+        except Exception:
+            pass
+        try:
             r = self.session.delete(
                 f"{ARENA_URL}/api/rooms/{ROOM_ID}/presence/{self.presence_id}")
             if not r.ok:
@@ -156,7 +165,7 @@ class ArenaBot:
     # ── MCTS decision ─────────────────────────────────────────────────────────
     def _time_budget(self, time_left: float, move_no: int = 0) -> float:
         """Spend more time in midgame/endgame, less in opening."""
-        fraction = min(0.10 + move_no * 0.005, 0.30)  # 10% → 30% over 40 moves
+        fraction = min(0.15 + move_no * 0.005, 0.30)  # 15% → 30% over 30 moves
         usable   = max(time_left - 10.0, 0.0)
         budget   = min(usable * fraction, 20.0)
         return max(budget, 1.0)
@@ -169,27 +178,57 @@ class ArenaBot:
             return
         self._last_move_key = move_key
         self.mcts.clear_cache()
-        t0 = time.time()
-        if BOT_SIMS > 0:
-            # fixed-sims mode (override from env)
-            probs = self.mcts.get_action_probs(
-                self.game_state, temperature=0.0, add_noise=False
-            )
-        elif time_left > 0:
-            budget = self._time_budget(time_left, move_no)
-            log.info(f"Thinking for {budget:.1f}s (bank={time_left:.1f}s move={move_no})")
-            probs = self.mcts.get_action_probs_timed(
-                self.game_state, seconds=budget, add_noise=False
-            )
-        else:
-            # no time info (sandbox inject) — fallback fixed sims
-            probs = self.mcts.get_action_probs(
-                self.game_state, temperature=0.0, add_noise=False
-            )
-        log.info(f"MCTS done in {time.time() - t0:.2f}s")
-        idx         = int(np.argmax(probs))
-        row, col, s = self.game_state.index_to_action(idx)
-        self._move(row, col, s)
+
+        try:
+            forced = find_forced_move(self.game_state)
+            if forced:
+                row, col, s = forced
+                log.info(f"Forced move: ({row},{col}) strong={s}")
+                self._move(row, col, s)
+                return
+
+            t0 = time.time()
+            if BOT_SIMS > 0:
+                # fixed-sims mode (override from env)
+                probs = self.mcts.get_action_probs(
+                    self.game_state, temperature=0.0, add_noise=False
+                )
+            elif time_left > 0:
+                budget = self._time_budget(time_left, move_no)
+                if BOT_HEURISTIC:
+                    budget = min(budget, 5.0)  # alpha-beta: >5s gives diminishing returns
+                log.info(f"Thinking for {budget:.1f}s (bank={time_left:.1f}s move={move_no})")
+                probs = self.mcts.get_action_probs_timed(
+                    self.game_state, seconds=budget, add_noise=False
+                )
+            elif BOT_HEURISTIC:
+                # no time info but heuristic mode — use default 3s timed search
+                budget = 3.0
+                log.info(f"Thinking for {budget:.1f}s (no bank, heuristic default)")
+                probs = self.mcts.get_action_probs_timed(
+                    self.game_state, seconds=budget, add_noise=False
+                )
+            else:
+                # no time info (sandbox inject) — fallback fixed sims
+                probs = self.mcts.get_action_probs(
+                    self.game_state, temperature=0.0, add_noise=False
+                )
+            log.info(f"MCTS done in {time.time() - t0:.2f}s")
+            idx         = int(np.argmax(probs))
+            row, col, s = self.game_state.index_to_action(idx)
+            self._move(row, col, s)
+
+        except Exception as e:
+            log.error(f"MCTS failed: {e!r} — falling back to greedy move")
+            try:
+                valid = self.game_state.get_valid_moves()
+                if valid:
+                    idx = valid[len(valid) // 2]
+                    row, col, s = self.game_state.index_to_action(idx)
+                    log.info(f"Greedy fallback: ({row},{col}) strong={s}")
+                    self._move(row, col, s)
+            except Exception as e2:
+                log.error(f"Fallback also failed: {e2!r}")
 
     # ── Snapshot handler ──────────────────────────────────────────────────────
     def _handle_snapshot(self, room: dict):
@@ -202,12 +241,16 @@ class ArenaBot:
         else:
             self.my_player_id = None
 
-        # Take an empty seat if available
+        # Take an empty seat if available (black=P1=key"1", white=P2=key"2")
         if self.my_player_id is None:
-            if su.get("1") is None:
-                self._seat("black")
-            elif su.get("2") is None:
-                self._seat("white")
+            order = ["black", "white"]
+            if BOT_COLOR == "white":
+                order = ["white", "black"]
+            seat_key = {"black": "1", "white": "2"}
+            for color in order:
+                if su.get(seat_key[color]) is None:
+                    self._seat(color)
+                    break
             return
 
         pid = str(self.my_player_id)
@@ -230,6 +273,12 @@ class ArenaBot:
         except Exception as e:
             log.error(f"State rebuild failed: {e}")
             self.game_state = None
+
+        # Log game result when game ends
+        if self.game_state and self.game_state.game_over:
+            winner = room.get("winner") or room.get("result") or "?"
+            my_color = "black" if self.my_player_id == 1 else "white"
+            log.info(f"[GAME OVER] winner={winner} I_am={my_color}(p{self.my_player_id}) moves={len(moves)}")
 
         # Move phase
         if room.get("awaiting_move") and self.game_state:
@@ -294,29 +343,34 @@ def main():
     if missing:
         sys.exit(f"Missing env vars: {', '.join(missing)}")
 
-    cfg    = Config()
-    device = torch.device("cpu")
-    net    = build_net(cfg.NUM_RES_BLOCKS, cfg.NUM_CHANNELS, device=device)
+    cfg = ConfigLarge() if os.getenv("BOT_LARGE") else Config()
 
-    if os.path.exists(cfg.BEST_MODEL_PATH):
-        ckpt = torch.load(cfg.BEST_MODEL_PATH, map_location=device)
-        sd   = ckpt["model"] if isinstance(ckpt, dict) and "model" in ckpt else ckpt
-        net.load_state_dict(sd)
-        log.info(f"Loaded model: {cfg.BEST_MODEL_PATH}")
+    if BOT_HEURISTIC:
+        log.info("Mode: heuristic alpha-beta (BOT_HEURISTIC=1)")
+        agent = HeuristicAgent(depth=4)
     else:
-        log.warning("No trained model — using random weights!")
+        device = torch.device("cpu")
+        net    = build_net(cfg.NUM_RES_BLOCKS, cfg.NUM_CHANNELS, device=device)
+        if os.path.exists(cfg.BEST_MODEL_PATH):
+            ckpt = torch.load(cfg.BEST_MODEL_PATH, map_location=device)
+            sd   = ckpt["model"] if isinstance(ckpt, dict) and "model" in ckpt else ckpt
+            net.load_state_dict(sd)
+            log.info(f"Loaded model: {cfg.BEST_MODEL_PATH}")
+        else:
+            log.warning("No trained model — using random weights!")
+        net.eval()
+        agent = MCTS(
+            net,
+            num_simulations  = BOT_SIMS if BOT_SIMS > 0 else 800,
+            c_puct           = cfg.C_PUCT,
+            dirichlet_alpha  = cfg.DIRICHLET_ALPHA,
+            dirichlet_eps    = 0.0,
+            leaf_batch_size  = cfg.LEAF_BATCH_SIZE,
+            heuristic_weight = 1.5,
+        )
+        log.info("Mode: AlphaZero MCTS")
 
-    net.eval()
-    mcts = MCTS(
-        net,
-        num_simulations  = BOT_SIMS if BOT_SIMS > 0 else 200,  # fallback for time-budget mode
-        c_puct           = cfg.C_PUCT,
-        dirichlet_alpha  = cfg.DIRICHLET_ALPHA,
-        dirichlet_eps    = 0.0,
-        leaf_batch_size  = cfg.LEAF_BATCH_SIZE,
-    )
-
-    ArenaBot(mcts).run()
+    ArenaBot(agent).run()
 
 
 if __name__ == "__main__":

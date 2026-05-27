@@ -1,10 +1,13 @@
 #!/usr/bin/env bash
 # Usage: ./scripts/play.sh [SIMS1] [SIMS2]
 # 0 or omitted = time-budget mode. e.g. ./play.sh 600 400
+# BOT1_LARGE=1 / BOT2_LARGE=1 to use large model per bot
 set -euo pipefail
 
 SIMS1=${1:-0}
 SIMS2=${2:-$SIMS1}
+LARGE1=${BOT1_LARGE:-}
+LARGE2=${BOT2_LARGE:-}
 KEY1="ra_bot_0MK0g0xYR_x1eAvwgOY9rsVLjzX0LgeN"
 KEY2="ra_bot_f7GpHUwSFNNLPI5UgjqOpjyPSlEHYUiM"
 BASE="https://arena.ebg.tw"
@@ -43,10 +46,10 @@ echo "Room: $ROOM  (B1=$LABEL1  B2=$LABEL2)"
 echo "Watch: $BASE/room/$ROOM"
 
 # Start bots — log to files, capture real python PIDs
-ARENA_URL=$BASE BOT_API_KEY=$KEY1 ROOM_ID=$ROOM BOT_SIMS=$SIMS1 python bot.py > "$LOG1" 2>&1 &
+ARENA_URL=$BASE BOT_API_KEY=$KEY1 ROOM_ID=$ROOM BOT_SIMS=$SIMS1 BOT_LARGE=$LARGE1 python bot.py > "$LOG1" 2>&1 &
 PID1=$!
 sleep 0.5
-ARENA_URL=$BASE BOT_API_KEY=$KEY2 ROOM_ID=$ROOM BOT_SIMS=$SIMS2 python bot.py > "$LOG2" 2>&1 &
+ARENA_URL=$BASE BOT_API_KEY=$KEY2 ROOM_ID=$ROOM BOT_SIMS=$SIMS2 BOT_LARGE=$LARGE2 python bot.py > "$LOG2" 2>&1 &
 PID2=$!
 
 # Stream both logs with prefix

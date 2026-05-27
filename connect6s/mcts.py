@@ -18,34 +18,76 @@ EPS          = 1e-8
 VIRTUAL_LOSS = 1   # virtual losses per in-flight simulation
 
 
+def _max_runs(board: np.ndarray) -> np.ndarray:
+    """
+    For each position (r,c), compute max consecutive run of `board` pieces
+    passing through (r,c) across 4 directions (pieces on both sides, not
+    counting (r,c) itself).  Returns int32 array shape (N, N).
+    """
+    N = BOARD_SIZE
+    b = board.astype(np.int32)
+    best = np.zeros((N, N), dtype=np.int32)
+
+    # Horizontal (0,1)
+    fwd = np.zeros((N, N), dtype=np.int32)
+    bwd = np.zeros((N, N), dtype=np.int32)
+    for c in range(N - 2, -1, -1):
+        fwd[:, c] = b[:, c + 1] * (fwd[:, c + 1] + 1)
+    for c in range(1, N):
+        bwd[:, c] = b[:, c - 1] * (bwd[:, c - 1] + 1)
+    best = np.maximum(best, fwd + bwd)
+
+    # Vertical (1,0)
+    fwd[:] = 0; bwd[:] = 0
+    for r in range(N - 2, -1, -1):
+        fwd[r, :] = b[r + 1, :] * (fwd[r + 1, :] + 1)
+    for r in range(1, N):
+        bwd[r, :] = b[r - 1, :] * (bwd[r - 1, :] + 1)
+    best = np.maximum(best, fwd + bwd)
+
+    # Diagonal (1,1)
+    fwd[:] = 0; bwd[:] = 0
+    for r in range(N - 2, -1, -1):
+        for c in range(N - 2, -1, -1):
+            fwd[r, c] = b[r + 1, c + 1] * (fwd[r + 1, c + 1] + 1)
+    for r in range(1, N):
+        for c in range(1, N):
+            bwd[r, c] = b[r - 1, c - 1] * (bwd[r - 1, c - 1] + 1)
+    best = np.maximum(best, fwd + bwd)
+
+    # Anti-diagonal (1,-1)
+    fwd[:] = 0; bwd[:] = 0
+    for r in range(N - 2, -1, -1):
+        for c in range(1, N):
+            fwd[r, c] = b[r + 1, c - 1] * (fwd[r + 1, c - 1] + 1)
+    for r in range(1, N):
+        for c in range(N - 2, -1, -1):
+            bwd[r, c] = b[r - 1, c + 1] * (bwd[r - 1, c + 1] + 1)
+    best = np.maximum(best, fwd + bwd)
+
+    return best
+
+
 def _threat_prior(obs: np.ndarray, legal_moves) -> np.ndarray:
     """
     Heuristic threat scores per action for cold-start bootstrapping.
     Defense (blocking opponent) is weighted 3x attack so MCTS reliably
     blocks even when the NN policy is biased toward attacking.
     Mixed into network policy via: policy * exp(weight * score).
+    Vectorized: precompute run-lengths for whole board, then look up per move.
     """
-    N    = BOARD_SIZE
-    own  = (obs[0] + obs[1]) > 0.5   # current player's pieces
-    opp  = (obs[2] + obs[3]) > 0.5   # opponent's pieces
+    N   = BOARD_SIZE
+    own = (obs[0] + obs[1]) > 0.5
+    opp = (obs[2] + obs[3]) > 0.5
+
+    own_runs = _max_runs(own)
+    opp_runs = _max_runs(opp)
+
     scores = np.zeros(ACTION_SIZE, dtype=np.float32)
     for r, c, is_s in legal_moves:
-        idx      = (N * N if is_s else 0) + r * N + c
-        best_own = best_opp = 0
-        for dr, dc in ((0, 1), (1, 0), (1, 1), (1, -1)):
-            cnt_own = cnt_opp = 0
-            for sign in (1, -1):
-                nr, nc = r + sign * dr, c + sign * dc
-                while 0 <= nr < N and 0 <= nc < N and own[nr, nc]:
-                    cnt_own += 1; nr += sign * dr; nc += sign * dc
-            for sign in (1, -1):
-                nr, nc = r + sign * dr, c + sign * dc
-                while 0 <= nr < N and 0 <= nc < N and opp[nr, nc]:
-                    cnt_opp += 1; nr += sign * dr; nc += sign * dc
-            best_own = max(best_own, cnt_own)
-            best_opp = max(best_opp, cnt_opp)
+        idx = (N * N if is_s else 0) + r * N + c
         # Defense weighted 3x: blocking a 4-row (score=12) >> extending own 4 (score=4)
-        scores[idx] = best_own + 3.0 * best_opp
+        scores[idx] = float(own_runs[r, c]) + 3.0 * float(opp_runs[r, c])
     return scores
 
 
@@ -65,7 +107,7 @@ class MCTSNode:
     @property
     def mean_value(self) -> float:
         # Each in-flight sim contributes -1 virtual loss from current player's POV
-        return (self.value_sum - self.in_flight) / (self.visit_count + EPS)
+        return (self.value_sum + self.in_flight) / (self.visit_count + EPS)
 
     def ucb_score(self, parent_n: int, c_puct: float) -> float:
         q = -self.mean_value   # child's value from child's POV → negate for parent
@@ -75,8 +117,14 @@ class MCTSNode:
     def best_child(self, c_puct: float):
         best_s, best_n, best_i = -math.inf, None, -1
         n = self.visit_count
+        # FPU: unvisited children use parent's Q instead of 0.
+        # Prevents Q=0 optimism from beating visited nodes with negative Q.
+        fpu = self.mean_value
         for idx, child in self.children.items():
-            s = child.ucb_score(n, c_puct)
+            if child.visit_count + child.in_flight == 0:
+                s = fpu + c_puct * child.prior * math.sqrt(n)
+            else:
+                s = child.ucb_score(n, c_puct)
             if s > best_s:
                 best_s, best_n, best_i = s, child, idx
         return best_n, best_i
@@ -137,17 +185,21 @@ class MCTS:
         state = node.state
         key   = state.zobrist_hash
         if key not in self._cache:
-            legal = state.get_legal_moves()
-            if not legal:
+            if state.game_over:
+                # Terminal — value computed by caller from winner; skip NN
                 self._cache[key] = (np.zeros(ACTION_SIZE, np.float32), 0.0)
             else:
-                obs    = state.get_observation()
-                policy, value = self.network.predict(obs)
-                if self.heuristic_weight > 0:
-                    threat = _threat_prior(obs, legal)
-                    policy = policy * np.exp(np.clip(threat * self.heuristic_weight, 0, 15))
-                masked = self._mask_and_normalize(policy, legal)
-                self._cache[key] = (masked, value)
+                legal = state.get_legal_moves()
+                if not legal:
+                    self._cache[key] = (np.zeros(ACTION_SIZE, np.float32), 0.0)
+                else:
+                    obs    = state.get_observation()
+                    policy, value = self.network.predict(obs)
+                    if self.heuristic_weight > 0:
+                        threat = _threat_prior(obs, legal)
+                        policy = policy * np.exp(np.clip(threat * self.heuristic_weight, 0, 15))
+                    masked = self._mask_and_normalize(policy, legal)
+                    self._cache[key] = (masked, value)
         masked, value = self._cache[key]
         if node.is_leaf() and not state.game_over:
             legal = state.get_legal_moves()
@@ -164,11 +216,14 @@ class MCTS:
             child.prior = (1 - self.dirichlet_eps) * child.prior + self.dirichlet_eps * n
 
     # ------------------------------------------------------------------
-    def run(self, state: GameState, add_noise=True, deadline: float | None = None) -> np.ndarray:
+    def run(self, state: GameState, add_noise=True, deadline: float | None = None,
+            n_sims: int | None = None) -> np.ndarray:
         """
         Run MCTS and return visit-count vector of shape [ACTION_SIZE].
         If deadline is set (epoch seconds), stop when time is reached regardless of sim count.
+        n_sims overrides self.num_simulations for this call only.
         """
+        limit = n_sims if n_sims is not None else self.num_simulations
         root = MCTSNode(state)
         self._ensure_cached(root)
         if add_noise:
@@ -177,8 +232,8 @@ class MCTS:
         done = 0
         B    = self.leaf_batch_size
 
-        while done < self.num_simulations and (deadline is None or time.time() < deadline):
-            batch = min(B, self.num_simulations - done)
+        while done < limit and (deadline is None or time.time() < deadline):
+            batch = min(B, limit - done)
 
             # ── SELECT (with virtual loss) ────────────────────────────
             selected: list[tuple[MCTSNode, list[MCTSNode]]] = []
@@ -283,3 +338,11 @@ class MCTS:
                                            add_noise=add_noise)
         action_idx = int(np.random.choice(ACTION_SIZE, p=probs))
         return state.index_to_action(action_idx), probs
+
+
+# C++ drop-in (overrides Python class if extension is built)
+try:
+    from connect6s_mcts_cpp import MCTS   # noqa: F811
+    _USING_CPP_MCTS = True
+except ImportError:
+    _USING_CPP_MCTS = False
