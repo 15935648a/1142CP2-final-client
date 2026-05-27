@@ -224,9 +224,10 @@ static int eval_side(const Board& b, int p) {
                     if (ar >= 0 && ar < N && ac >= 0 && ac < N
                             && b.cell[ar][ac] == 0) open_ends++;
                 }
-                if (open_ends == 2 && n_own == 2) contrib = S_2 * 15;  // live-2 early warning: ~300
-                else if (open_ends == 2) contrib = contrib * 3 / 2;   // live 3+: +50%
-                else if (open_ends == 0 && n_own >= 4) contrib /= 2;  // dead high-threat: -50%
+                if      (open_ends == 2 && n_own == 2) contrib = S_2 * 15; // live-2: ~300
+                else if (open_ends == 2)              contrib = contrib * 3 / 2; // live 3+: +50%
+                // open_ends == 1: keep base contrib (half-open, no multiplier)
+                else if (open_ends == 0 && n_own >= 3) contrib /= 2;  // dead 3+: -50%
 
                 score += contrib;
             }
@@ -325,7 +326,7 @@ static std::vector<std::pair<int,Move>> gen_moves(const Board& b) {
     auto make_score = [](int atk, int def, int bonus = 0) -> int {
         if (atk >= S_WIN) return 3*S_WIN + atk;
         if (def >= S_WIN) return 2*S_WIN + def;
-        return 2*atk + def + bonus;  // 2x atk: prefer extensions over blocks
+        return atk + 6*def/5 + bonus;  // 1.2x def: balanced attack/defense
     };
 
     for (int r = 0; r < N; r++) {
@@ -339,9 +340,15 @@ static std::vector<std::pair<int,Move>> gen_moves(const Board& b) {
                 int def = cell_value(b, r, c, -b.player);
                 int bonus = hist;
                 if (atk < S_WIN && def < S_WIN) {
+                    // Own fork bonus: we create double-attack
                     if (count_fork_directions(b, r, c, b.player, 4) >= 2)
                         bonus += FORK_BONUS;
                     else if (count_fork_directions(b, r, c, b.player, 3) >= 2)
+                        bonus += FORK3_BONUS;
+                    // Opponent fork block: prevent opponent double-threat
+                    if (count_fork_directions(b, r, c, -b.player, 4) >= 2)
+                        bonus += FORK_BONUS;
+                    else if (count_fork_directions(b, r, c, -b.player, 3) >= 2)
                         bonus += FORK3_BONUS;
                 }
                 moves.push_back({make_score(atk, def, bonus), {r, c, false}});
@@ -365,13 +372,16 @@ static std::vector<std::pair<int,Move>> gen_moves(const Board& b) {
                     int atk = cell_value(b, r, c,  b.player) * 3 / 2;
                     int def = cell_value(b, r, c, -b.player);
                     int bonus = hist;
-                    // Fork bonus: capture creates multi-direction attack
                     if (atk < S_WIN && def < S_WIN) {
+                        // Unblockable fork: strong piece fork is lethal (×1.5 bonus)
                         if (count_fork_directions(b, r, c, b.player, 4) >= 2)
-                            bonus += FORK_BONUS;
+                            bonus += FORK_BONUS * 3 / 2;
                         else if (count_fork_directions(b, r, c, b.player, 3) >= 2)
-                            bonus += FORK3_BONUS;
+                            bonus += FORK3_BONUS * 3 / 2;
                     }
+                    // High-threat line bonus: capture forms 5-in-a-row or 4-in-a-row
+                    if      (atk >= S_5) bonus += S_5;
+                    else if (atk >= S_4) bonus += S_4 * 5;
                     // Chain-break bonus: disrupting opponent's 4+ threat
                     if (def >= S_4) bonus += S_4;
                     moves.push_back({make_score(atk, 3*def/2, bonus), {r, c, true}});
@@ -397,7 +407,8 @@ static std::vector<std::pair<int,Move>> gen_moves(const Board& b) {
     for (int i = 0; i < 30; i++) result.push_back(moves[i]);
     for (int i = 30; i < (int)moves.size(); i++) {
         auto& [sc, m] = moves[i];
-        if (cell_value(b, m.r, m.c, -b.player) >= S_4)
+        if (cell_value(b, m.r, m.c, -b.player) >= S_4
+            || count_fork_directions(b, m.r, m.c, -b.player, 3) >= 2)
             result.push_back(moves[i]);
     }
     return result;
