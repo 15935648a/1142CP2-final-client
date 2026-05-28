@@ -196,7 +196,7 @@ class ArenaBot:
             elif time_left > 0:
                 budget = self._time_budget(time_left, move_no)
                 if BOT_HEURISTIC:
-                    budget = min(budget, 5.0)  # alpha-beta: >5s gives diminishing returns
+                    budget = min(budget, 10.0)  # alpha-beta: deeper search worth the time
                 log.info(f"Thinking for {budget:.1f}s (bank={time_left:.1f}s move={move_no})")
                 probs = self.mcts.get_action_probs_timed(
                     self.game_state, seconds=budget, add_noise=False
@@ -279,6 +279,14 @@ class ArenaBot:
             winner = room.get("winner") or room.get("result") or "?"
             my_color = "black" if self.my_player_id == 1 else "white"
             log.info(f"[GAME OVER] winner={winner} I_am={my_color}(p{self.my_player_id}) moves={len(moves)}")
+            # Log full move history to diagnose opponent strategy
+            my_pid = self.my_player_id
+            for i, m in enumerate(moves):
+                who = "ME  " if (i % 2 == 0) == (my_pid == 1) else "OPP "
+                coords = m.get("coords") or []
+                r_str = coords[0] if len(coords) > 0 else "?"
+                c_str = coords[1] if len(coords) > 1 else "?"
+                log.info(f"  [HIST] move={i} {who} ({r_str},{c_str}) strong={m.get('strong',False)}")
 
         # Move phase
         if room.get("awaiting_move") and self.game_state:

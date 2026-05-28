@@ -225,7 +225,8 @@ static int eval_side(const Board& b, int p) {
                             && b.cell[ar][ac] == 0) open_ends++;
                 }
                 if      (open_ends == 2 && n_own == 2) contrib = S_2 * 15; // live-2: ~300
-                else if (open_ends == 2)              contrib = contrib * 3 / 2; // live 3+: +50%
+                else if (open_ends == 2 && n_own == 3) contrib *= 4;  // live-3: both ends open = dangerous
+                else if (open_ends == 2)              contrib = contrib * 3 / 2; // live 4+: +50%
                 // open_ends == 1: keep base contrib (half-open, no multiplier)
                 else if (open_ends == 0 && n_own >= 3) contrib /= 2;  // dead 3+: -50%
 
@@ -236,7 +237,6 @@ static int eval_side(const Board& b, int p) {
     return score;
 }
 
-// Defense weighted 1.2× (reduced from 1.5× to encourage proactive play)
 static int heuristic(const Board& b) {
     return eval_side(b, b.player) - 6 * eval_side(b, -b.player) / 5;
 }
@@ -258,7 +258,20 @@ static int cell_value(const Board& b, int r, int c, int p) {
                 if (Board::owns(v, p)) n_own++; else n_opp++;
             }
             if (n_opp > 0) continue;
-            score += WIN_SCORE[std::min(n_own + 1, 6)];
+            int contrib = WIN_SCORE[std::min(n_own + 1, 6)];
+            // Openness multiplier: live threats (both ends open) are far more
+            // dangerous than half-open or dead ones. Without this, cell_value
+            // under-rates blocking moves vs extending own pieces (which
+            // naturally count windows in all 4 directions).
+            if (n_own + 1 >= 3) {
+                int br = sr - DR4[d], bc = sc - DC4[d];
+                int ar = er + DR4[d], ac = ec + DC4[d];
+                bool open_lo = (br>=0&&br<N&&bc>=0&&bc<N && b.cell[br][bc]==0);
+                bool open_hi = (ar>=0&&ar<N&&ac>=0&&ac<N && b.cell[ar][ac]==0);
+                if      (open_lo && open_hi) contrib *= 2;  // live: double threat value
+                else if (!open_lo && !open_hi) contrib /= 2; // dead: halve
+            }
+            score += contrib;
         }
     }
     return score;
@@ -317,8 +330,14 @@ static std::vector<std::pair<int,Move>> gen_moves(const Board& b) {
     if (!any) return {{0, {N/2, N/2, false}}};
 
     static constexpr int FORK_BONUS   = S_5;       // double-4 = near-forced-win → S_5
-    static constexpr int FORK3_BONUS  = 3 * S_3;   // double-live-3 → dangerous setup
+    static constexpr int FORK3_BONUS  = 8 * S_3;    // double-live-3 → dangerous setup
     int pidx = b.player > 0 ? 0 : 1;
+	int next_refresh = 6;
+	while (next_refresh <= b.move_count) {
+		next_refresh += 7;
+	}
+	bool is_last_chance = (next_refresh <= b.move_count + 3);
+	int strong_penalty = is_last_chance ? 0 : -S_3/2;
 
     std::vector<std::pair<int,Move>> moves;
     moves.reserve(150);
@@ -326,7 +345,7 @@ static std::vector<std::pair<int,Move>> gen_moves(const Board& b) {
     auto make_score = [](int atk, int def, int bonus = 0) -> int {
         if (atk >= S_WIN) return 3*S_WIN + atk;
         if (def >= S_WIN) return 2*S_WIN + def;
-        return atk + 6*def/5 + bonus;  // 1.2x def: balanced attack/defense
+        return atk + 6*def/5 + bonus;  // 1.2x def
     };
 
     for (int r = 0; r < N; r++) {
@@ -358,7 +377,7 @@ static std::vector<std::pair<int,Move>> gen_moves(const Board& b) {
                 if (v == 0 && near[r][c]) {
                     int atk = cell_value(b, r, c,  b.player);
                     int def = cell_value(b, r, c, -b.player);
-                    int bonus = -S_3/2 + hist;  // strong penalty: save strong pieces for captures
+                    int bonus = strong_penalty + hist;  // strong penalty: waived on last
                     if (atk < S_WIN && def < S_WIN) {
                         if (count_fork_directions(b, r, c, b.player, 4) >= 2)
                             bonus += FORK_BONUS;

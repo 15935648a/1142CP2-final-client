@@ -98,7 +98,8 @@ def find_forced_move(state):
        - If we hold a strong piece and threat is singular: place strong on
          the middle of the opponent's sequence (breaks it + captures piece).
        - Otherwise block normally.
-    3. Proactively break opponent's longest 4+ sequence with strong on middle.
+
+    Proactive defense (sections 3+) removed — alpha-beta handles it.
     """
     player     = state.current_player
     opp        = -player
@@ -120,7 +121,7 @@ def find_forced_move(state):
     if strong_win:
         return strong_win
 
-    # ── 2. Block opponent's winning threats ───────────────────────────────────
+    # ── 2. Block opponent's immediate winning threats ─────────────────────────
     threats: set = set()
     for r in range(N):
         for c in range(N):
@@ -133,48 +134,55 @@ def find_forced_move(state):
                     threats.add((r, c))
 
     if threats:
-        # Single threat + strong piece → try middle-of-sequence strong block
         if has_strong and len(threats) == 1:
             tr, tc = next(iter(threats))
             mid = _middle_strong_block(board, opp, tr, tc, legal_set)
             if mid:
                 return mid
-        # Standard block (regular first, strong fallback)
         for r, c in sorted(threats):
             if (r, c, False) in legal_set:
                 return (r, c, False)
-            if has_strong and (r, c, True) in legal_set:
-                return (r, c, True)
-        # Multiple threats — try to upgrade our piece at one endpoint to
-        # strong (opponent must spend their strong piece to break through).
-        # Better than a random move from C++ in a near-loss position.
         for r, c in sorted(threats):
             if has_strong and (r, c, True) in legal_set:
                 return (r, c, True)
-        # Last resort: block one threat with a regular piece anyway
-        for r, c in sorted(threats):
-            if (r, c, False) in legal_set:
-                return (r, c, False)
         return None  # truly unblockable
 
-    # ── 3. Proactive: block opp's 4+ sequence ────────────────────────────────
-    seqs = _find_seqs(board, opp, min_len=4)
-    seqs.sort(key=len, reverse=True)
-    for cells in seqs:
-        # Strong on middle destroys the sequence (best if available)
-        # Only capture empty or opponent regular — never upgrade our own piece
-        if has_strong:
-            mr, mc = cells[len(cells) // 2]
-            cell_val = int(board[mr, mc])
-            if cell_val * player <= 0:  # empty or opponent piece
-                if (mr, mc, True) in legal_set:
-                    return (mr, mc, True)
-        # Regular piece at either open end
+    # ── 3b. Block fully-open opp 3-seq ───────────────────────────────────────
+    # Depth-5 horizon effect: alpha-beta "plans" to block later while building
+    # own live-3, but misses strong-capture danger. Force block here.
+    # Skip if we already have our own live-3 — let alpha-beta extend it (fork).
+    def _has_live3(p):
+        for cells in _find_seqs(board, p, min_len=3):
+            if len(cells) != 3:
+                continue
+            dr2 = cells[1][0] - cells[0][0]
+            dc2 = cells[1][1] - cells[0][1]
+            lo2 = (0 <= cells[0][0]-dr2 < N and 0 <= cells[0][1]-dc2 < N
+                   and int(board[cells[0][0]-dr2, cells[0][1]-dc2]) == 0)
+            hi2 = (0 <= cells[-1][0]+dr2 < N and 0 <= cells[-1][1]+dc2 < N
+                   and int(board[cells[-1][0]+dr2, cells[-1][1]+dc2]) == 0)
+            if lo2 and hi2:
+                return True
+        return False
+
+    if _has_live3(player):
+        return None  # we have live-3; alpha-beta will extend/fork
+
+    seqs3 = [cells for cells in _find_seqs(board, opp, min_len=3)
+             if len(cells) == 3]
+    seqs3.sort(key=len, reverse=True)
+    for cells in seqs3:
         dr = cells[1][0] - cells[0][0]
         dc = cells[1][1] - cells[0][1]
-        for r, c in [(cells[0][0] - dr, cells[0][1] - dc),
-                     (cells[-1][0] + dr, cells[-1][1] + dc)]:
-            if 0 <= r < N and 0 <= c < N and (r, c, False) in legal_set:
-                return (r, c, False)
+        lo_r, lo_c = cells[0][0] - dr, cells[0][1] - dc
+        hi_r, hi_c = cells[-1][0] + dr, cells[-1][1] + dc
+        lo_open = 0 <= lo_r < N and 0 <= lo_c < N and int(board[lo_r, lo_c]) == 0
+        hi_open = 0 <= hi_r < N and 0 <= hi_c < N and int(board[hi_r, hi_c]) == 0
+        if lo_open and hi_open:
+            for r, c in [(lo_r, lo_c), (hi_r, hi_c)]:
+                if (r, c, False) in legal_set:
+                    return (r, c, False)
+                if has_strong and (r, c, True) in legal_set:
+                    return (r, c, True)
 
     return None
