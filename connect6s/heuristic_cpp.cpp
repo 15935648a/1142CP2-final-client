@@ -202,9 +202,6 @@ static int eval_one_window(const Board& b, int sr, int sc, int d, int p) {
         else { n_opp++; if (std::abs((int)v) == 1) opp_has_reg = true; }
     }
     if (n_opp > 0) {
-        // Weak-block (strong-capture) threat: exactly 1 capturable opp regular
-        // blocks this window and p holds a strong piece. p can capture it — the
-        // cell then becomes p-owned → effective own count = n_own + 1.
         // p can win via strong capture: 5 own + 1 capturable opp regular + p has strong piece
         if (n_own == 5 && n_opp == 1 && opp_has_reg && b.strong[(p > 0) ? 0 : 1] > 0)
             return S_5;
@@ -274,7 +271,6 @@ static int eval_side(const Board& b, int p) {
                     } else { n_opp++; if (std::abs((int)v) == 1) opp_has_reg = true; }
                 }
                 if (n_opp > 0) {
-                    // Weak-block (strong-capture) threat — see eval_one_window.
                     if (n_own == 5 && n_opp == 1 && opp_has_reg && b.strong[(p > 0) ? 0 : 1] > 0)
                         { score += S_5; }
                     continue;
@@ -560,6 +556,34 @@ static std::vector<std::pair<int,int>> vcf_gaps(
     return gaps;
 }
 
+// True if player p can make 6-in-a-row THIS move (fill a gap, or strong-capture
+// the single opp regular that completes a 6). Used as a VCF soundness guard:
+// a forced "block" is only forced if the defender has no faster winning reply.
+static bool can_win_now(const Board& b, int p) {
+    bool has_str = b.strong[(p > 0) ? 0 : 1] > 0;
+    for (int r = 0; r < N; r++) {
+        for (int c = 0; c < N; c++) {
+            for (int d = 0; d < 4; d++) {
+                int er = r + DR4[d]*5, ec = c + DC4[d]*5;
+                if (er < 0 || er >= N || ec < 0 || ec >= N) continue;
+                int n_own = 0, n_empty = 0, n_oppreg = 0, n_oppstr = 0;
+                for (int j = 0; j < 6; j++) {
+                    int8_t v = b.cell[r + DR4[d]*j][c + DC4[d]*j];
+                    if (v == 0) n_empty++;
+                    else if (Board::owns(v, p)) n_own++;
+                    else if (std::abs((int)v) == 1) n_oppreg++;
+                    else n_oppstr++;
+                }
+                if (n_own == 5) {
+                    if (n_empty == 1) return true;                       // fill gap → 6
+                    if (has_str && n_oppreg == 1 && n_oppstr == 0) return true; // capture → 6
+                }
+            }
+        }
+    }
+    return false;
+}
+
 static int vcf_rec(const Board& b, int attacker, int ply) {
     if (ply >= VCF_MAX_PLY) return -1;
 
@@ -572,6 +596,10 @@ static int vcf_rec(const Board& b, int attacker, int ply) {
 
             Board after_atk = b.apply(r, c, false);
             int atk_idx = r*N + c;
+
+            // Soundness: if defender can win immediately, they ignore our threat
+            // and win first → this line is not a forced win.
+            if (can_win_now(after_atk, -attacker)) continue;
 
             if ((int)gaps.size() >= 2) return atk_idx;  // dual threat = unblockable
 
@@ -595,6 +623,8 @@ static int vcf_rec(const Board& b, int attacker, int ply) {
 
                 Board after_atk = b.apply(r, c, true);
                 int atk_idx = NN + r*N + c;
+
+                if (can_win_now(after_atk, -attacker)) continue;
 
                 if ((int)gaps.size() >= 2) return atk_idx;
 
@@ -878,6 +908,24 @@ public:
         {
             int vcf_idx = vcf_search(b);
             if (vcf_idx >= 0) return vcf_idx;
+        }
+
+        // Opponent-VCF defense: a forced opponent win can be a deep (8-14 ply)
+        // forcing sequence the depth-limited IDA can't see (horizon). VCF detects
+        // it cheaply. If found, play the highest-ranked move that breaks ALL of
+        // the opponent's forced wins, rather than letting IDA wander into a loss.
+        {
+            Board ov = b;
+            ov.player = -b.player;                      // pretend opponent to move
+            if (vcf_rec(ov, -b.player, 0) >= 0) {
+                auto cands = gen_moves(b);              // sorted best-first
+                for (auto& [sc, m] : cands) {
+                    Board after = b.apply(m.r, m.c, m.is_str);  // toggles to opponent
+                    if (vcf_rec(after, after.player, 0) >= 0) continue;  // still loses
+                    return m.is_str ? (NN + m.r*N + m.c) : (m.r*N + m.c);
+                }
+                // No refutation exists → genuinely lost; fall through to IDA.
+            }
         }
 
         // Iterative deepening with aspiration windows
