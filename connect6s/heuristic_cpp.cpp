@@ -92,16 +92,22 @@ static void clear_search_tables() {
 }
 
 // ── Board ─────────────────────────────────────────────────────────────────────
+struct Board;
+static void update_scores_at(const Board& before, Board& after, int r, int c);  // fwd
+
 struct Board {
     int8_t   cell[N][N];
     int      player;
     int      move_count;
     int      strong[2];
     uint64_t zhash;
+    int      score[2];   // score[0]=eval for player1(black), score[1]=eval for player2(white)
+    int8_t   last_r, last_c;  // last placed cell; -1 on empty board
 
-    Board() : player(1), move_count(0), zhash(0) {
+    Board() : player(1), move_count(0), zhash(0), last_r(-1), last_c(-1) {
         std::memset(cell, 0, sizeof(cell));
         strong[0] = strong[1] = 0;
+        score[0]  = score[1]  = 0;
     }
 
     int  pidx()       const { return player > 0 ? 0 : 1; }
@@ -140,29 +146,28 @@ struct Board {
             if (nx.strong[0] < 1) { nx.zhash ^= zstrong[0]; nx.strong[0] = 1; }
             if (nx.strong[1] < 1) { nx.zhash ^= zstrong[1]; nx.strong[1] = 1; }
         }
+        nx.last_r = (int8_t)r;
+        nx.last_c = (int8_t)c;
+        update_scores_at(*this, nx, r, c);
         return nx;
     }
 
     int winner() const {
-        for (int r = 0; r < N; r++) {
-            for (int c = 0; c < N; c++) {
-                int8_t v = cell[r][c];
-                if (!v) continue;
-                int p = v > 0 ? 1 : -1;
-                for (int d = 0; d < 4; d++) {
-                    int pr = r - DR4[d], pc = c - DC4[d];
-                    if (pr >= 0 && pr < N && pc >= 0 && pc < N
-                            && owns(cell[pr][pc], p)) continue;
-                    int len = 1;
-                    for (int k = 1; k < 6; k++) {
-                        int nr = r + DR4[d]*k, nc = c + DC4[d]*k;
-                        if (nr < 0 || nr >= N || nc < 0 || nc >= N
-                                || !owns(cell[nr][nc], p)) break;
-                        len++;
-                    }
-                    if (len >= 6) return p;
+        if (last_r < 0) return 0;  // empty board
+        int8_t v = cell[last_r][last_c];
+        if (!v) return 0;
+        int p = v > 0 ? 1 : -1;
+        for (int d = 0; d < 4; d++) {
+            int cnt = 1;
+            for (int sign = 1; sign >= -1; sign -= 2) {
+                int rr = last_r + sign*DR4[d], cc = last_c + sign*DC4[d];
+                while (rr >= 0 && rr < N && cc >= 0 && cc < N && owns(cell[rr][cc], p)) {
+                    cnt++;
+                    rr += sign*DR4[d];
+                    cc += sign*DC4[d];
                 }
             }
+            if (cnt >= 6) return p;
         }
         return 0;
     }
@@ -182,6 +187,71 @@ static uint64_t compute_initial_hash(const Board& b) {
 
 // ── Evaluation ────────────────────────────────────────────────────────────────
 
+// Score contribution of a single 6-cell window starting at (sr,sc) direction d for player p.
+static int eval_one_window(const Board& b, int sr, int sc, int d, int p) {
+    int er = sr + DR4[d]*5, ec = sc + DC4[d]*5;
+    if (sr < 0 || sr >= N || sc < 0 || sc >= N) return 0;
+    if (er < 0 || er >= N || ec < 0 || ec >= N) return 0;
+
+    int  n_own = 0, n_opp = 0;
+    bool has_str = false, opp_has_reg = false;
+    for (int k = 0; k < 6; k++) {
+        int8_t v = b.cell[sr + DR4[d]*k][sc + DC4[d]*k];
+        if (!v) continue;
+        if (Board::owns(v, p)) { n_own++; if (std::abs((int)v) == 2) has_str = true; }
+        else { n_opp++; if (std::abs((int)v) == 1) opp_has_reg = true; }
+    }
+    if (n_opp > 0) {
+        // Weak-block (strong-capture) threat: exactly 1 capturable opp regular
+        // blocks this window and p holds a strong piece. p can capture it — the
+        // cell then becomes p-owned → effective own count = n_own + 1.
+        // p can win via strong capture: 5 own + 1 capturable opp regular + p has strong piece
+        if (n_own == 5 && n_opp == 1 && opp_has_reg && b.strong[(p > 0) ? 0 : 1] > 0)
+            return S_5;
+        return 0;
+    }
+    if (n_own == 6) return S_WIN;
+
+    int contrib = WIN_SCORE[n_own];
+    if (has_str && n_own > 0) contrib = contrib * 3 / 2;
+
+    int open_ends = 0;
+    int br = sr - DR4[d], bc = sc - DC4[d];
+    if (br >= 0 && br < N && bc >= 0 && bc < N && b.cell[br][bc] == 0) open_ends++;
+    int ar = er + DR4[d], ac = ec + DC4[d];
+    if (ar >= 0 && ar < N && ac >= 0 && ac < N && b.cell[ar][ac] == 0) open_ends++;
+
+    if      (open_ends == 2 && n_own == 2) return S_2 * 15;
+    else if (open_ends == 2 && n_own == 3) return contrib * 4;
+    else if (open_ends == 2)               return contrib * 3 / 2;
+    else if (open_ends == 0 && n_own >= 3) return contrib / 2;
+    return contrib;
+}
+
+// Update b.score[] incrementally after placing at (r,c).
+// `before` = board state before cell change, `after` = board with new cell already set.
+// Patches all windows that contain (r,c) or use it as an openness-check cell.
+static void update_scores_at(const Board& before, Board& after, int r, int c) {
+    for (int pi = 0; pi < 2; pi++) {
+        int p = (pi == 0) ? 1 : -1;
+        for (int d = 0; d < 4; d++) {
+            // k = 0..5: windows containing (r,c); k=-1,k=6: windows where (r,c) is adjacency cell
+            for (int k = -1; k <= 6; k++) {
+                int sr = r - DR4[d]*k, sc = c - DC4[d]*k;
+                after.score[pi] -= eval_one_window(before, sr, sc, d, p);
+                after.score[pi] += eval_one_window(after,  sr, sc, d, p);
+            }
+        }
+    }
+}
+
+static int eval_side(const Board& b, int p);  // forward declaration
+
+static void compute_initial_scores(Board& b) {
+    b.score[0] = eval_side(b,  1);
+    b.score[1] = eval_side(b, -1);
+}
+
 // Window openness: checks if cells just beyond both ends of the 6-window are
 // accessible (empty). Open windows are more likely to be completable.
 static int eval_side(const Board& b, int p) {
@@ -194,16 +264,21 @@ static int eval_side(const Board& b, int p) {
                 if (er < 0 || er >= N || ec < 0 || ec >= N) continue;
 
                 int  n_own = 0, n_opp = 0;
-                bool has_str = false;
+                bool has_str = false, opp_has_reg = false;
                 for (int k = 0; k < 6; k++) {
                     int8_t v = b.cell[r + DR4[d]*k][c + DC4[d]*k];
                     if (!v) continue;
                     if (Board::owns(v, p)) {
                         n_own++;
                         if (std::abs((int)v) == 2) has_str = true;
-                    } else n_opp++;
+                    } else { n_opp++; if (std::abs((int)v) == 1) opp_has_reg = true; }
                 }
-                if (n_opp > 0) continue;
+                if (n_opp > 0) {
+                    // Weak-block (strong-capture) threat — see eval_one_window.
+                    if (n_own == 5 && n_opp == 1 && opp_has_reg && b.strong[(p > 0) ? 0 : 1] > 0)
+                        { score += S_5; }
+                    continue;
+                }
                 if (n_own == 6) return S_WIN;
 
                 int contrib = WIN_SCORE[n_own];
@@ -238,7 +313,8 @@ static int eval_side(const Board& b, int p) {
 }
 
 static int heuristic(const Board& b) {
-    return eval_side(b, b.player) - 6 * eval_side(b, -b.player) / 5;
+    int pi = b.player > 0 ? 0 : 1;
+    return b.score[pi] - 6 * b.score[1 - pi] / 5;
 }
 
 static int cell_value(const Board& b, int r, int c, int p) {
@@ -333,7 +409,7 @@ static std::vector<std::pair<int,Move>> gen_moves(const Board& b) {
     static constexpr int FORK3_BONUS  = 8 * S_3;    // double-live-3 → dangerous setup
     int pidx = b.player > 0 ? 0 : 1;
 	int next_refresh = 6;
-	while (next_refresh <= b.move_count) {
+	while (next_refresh <= b.move_count + 1) {
 		next_refresh += 7;
 	}
 	bool is_last_chance = (next_refresh <= b.move_count + 3);
@@ -358,6 +434,16 @@ static std::vector<std::pair<int,Move>> gen_moves(const Board& b) {
                 int atk = cell_value(b, r, c,  b.player);
                 int def = cell_value(b, r, c, -b.player);
                 int bonus = hist;
+                // Connectivity bonus: adjacent to own piece → builds connected structure
+                for (int dr = -1; dr <= 1 && !(bonus & (S_3/2)); dr++)
+                    for (int dc = -1; dc <= 1; dc++) {
+                        if (!dr && !dc) continue;
+                        int nr=r+dr, nc=c+dc;
+                        if (nr>=0&&nr<N&&nc>=0&&nc<N&&Board::owns(b.cell[nr][nc],b.player))
+                            { bonus += S_3/2; break; }
+                    }
+                // Synergy bonus: dual-purpose move (both attacks and defends)
+                if (atk >= S_3 && def >= S_3) bonus += S_3;
                 if (atk < S_WIN && def < S_WIN) {
                     // Own fork bonus: we create double-attack
                     if (count_fork_directions(b, r, c, b.player, 4) >= 2)
@@ -433,10 +519,190 @@ static std::vector<std::pair<int,Move>> gen_moves(const Board& b) {
     return result;
 }
 
-// ── Alpha-beta negamax with TT + History ─────────────────────────────────────
+// Shared time-budget state (used by VCF, VCT, and alpha-beta)
 static bool time_up_flag = false;
 static std::chrono::steady_clock::time_point search_deadline;
 static int eval_counter = 0;
+
+// ── VCF (Victory by Consecutive Forcing / 追四勝) ────────────────────────────
+// Finds forced win via repeated 5-threats. Attacker creates 5-chain each move;
+// defender forced to fill the one gap. Terminates when attacker creates dual
+// simultaneous 5-threats (opponent can only block one → win through the other).
+
+static constexpr int VCF_MAX_PLY = 14;  // 7 attack+defense pairs
+
+// After virtually placing new_val at (r,c) for player p, collect all empty gap
+// cells opponent must fill to prevent immediate 6-in-a-row next turn.
+static std::vector<std::pair<int,int>> vcf_gaps(
+    const Board& b, int r, int c, int p, int8_t new_val)
+{
+    std::vector<std::pair<int,int>> gaps;
+    for (int d = 0; d < 4; d++) {
+        for (int k = 0; k < 6; k++) {
+            int sr = r - DR4[d]*k, sc = c - DC4[d]*k;
+            int er = sr + DR4[d]*5, ec = sc + DC4[d]*5;
+            if (sr<0||sr>=N||sc<0||sc>=N||er<0||er>=N||ec<0||ec>=N) continue;
+            int n_own=0, n_opp=0, gr=-1, gc=-1;
+            for (int j = 0; j < 6; j++) {
+                int kr = sr+DR4[d]*j, kc = sc+DC4[d]*j;
+                int8_t v = (kr==r && kc==c) ? new_val : b.cell[kr][kc];
+                if (Board::owns(v, p))  n_own++;
+                else if (v == 0)        { gr=kr; gc=kc; }
+                else                    n_opp++;
+            }
+            if (n_own==5 && n_opp==0 && gr>=0) {
+                auto gap = std::make_pair(gr, gc);
+                if (std::find(gaps.begin(), gaps.end(), gap) == gaps.end())
+                    gaps.push_back(gap);
+            }
+        }
+    }
+    return gaps;
+}
+
+static int vcf_rec(const Board& b, int attacker, int ply) {
+    if (ply >= VCF_MAX_PLY) return -1;
+
+    // Regular moves: empty cells that create a 5-threat
+    for (int r = 0; r < N; r++) {
+        for (int c = 0; c < N; c++) {
+            if (b.cell[r][c] != 0) continue;
+            auto gaps = vcf_gaps(b, r, c, attacker, (int8_t)attacker);
+            if (gaps.empty()) continue;
+
+            Board after_atk = b.apply(r, c, false);
+            int atk_idx = r*N + c;
+
+            if ((int)gaps.size() >= 2) return atk_idx;  // dual threat = unblockable
+
+            auto [gr, gc] = gaps[0];
+            if (after_atk.cell[gr][gc] != 0) continue;  // gap already occupied
+
+            Board after_blk = after_atk.apply(gr, gc, false);
+            if (vcf_rec(after_blk, attacker, ply + 2) >= 0)
+                return atk_idx;
+        }
+    }
+
+    // Strong capture moves: capture opp regular piece to create 5-threat
+    if (b.strong[b.player > 0 ? 0 : 1] > 0) {
+        for (int r = 0; r < N; r++) {
+            for (int c = 0; c < N; c++) {
+                if (!b.opp_reg(r, c)) continue;
+                int8_t nv = (int8_t)(attacker > 0 ? 2 : -2);
+                auto gaps = vcf_gaps(b, r, c, attacker, nv);
+                if (gaps.empty()) continue;
+
+                Board after_atk = b.apply(r, c, true);
+                int atk_idx = NN + r*N + c;
+
+                if ((int)gaps.size() >= 2) return atk_idx;
+
+                auto [gr, gc] = gaps[0];
+                if (after_atk.cell[gr][gc] != 0) continue;
+
+                Board after_blk = after_atk.apply(gr, gc, false);
+                if (vcf_rec(after_blk, attacker, ply + 2) >= 0)
+                    return atk_idx;
+            }
+        }
+    }
+
+    return -1;
+}
+
+static int vcf_search(const Board& b) { return vcf_rec(b, b.player, 0); }
+
+// ── VCT (Victory by Consecutive Threats) ──────────────────────────────────────
+// Extends VCF to handle 4-threats (live fours: 4 own + 2 empty + 0 opp in window).
+// Called after vcf_search fails. Uses the shared time_up_flag / search_deadline.
+
+static constexpr int VCT_MAX_PLY = 16;  // 8 attacker+defender pairs
+
+// After placing new_val at (r,c) for player p, return empty cells in windows
+// that have exactly 4 own + 2 empty + 0 opp (live-four blocking cells).
+static std::vector<std::pair<int,int>> vct_4threat_blocks(
+    const Board& b, int r, int c, int p, int8_t new_val)
+{
+    std::vector<std::pair<int,int>> blocks;
+    for (int d = 0; d < 4; d++) {
+        for (int k = 0; k < 6; k++) {
+            int sr = r - DR4[d]*k, sc = c - DC4[d]*k;
+            int er = sr + DR4[d]*5, ec = sc + DC4[d]*5;
+            if (sr<0||sr>=N||sc<0||sc>=N||er<0||er>=N||ec<0||ec>=N) continue;
+            int n_own=0, n_opp=0;
+            std::vector<std::pair<int,int>> empties;
+            for (int j = 0; j < 6; j++) {
+                int kr = sr+DR4[d]*j, kc = sc+DC4[d]*j;
+                int8_t v = (kr==r && kc==c) ? new_val : b.cell[kr][kc];
+                if (Board::owns(v, p)) n_own++;
+                else if (v == 0) empties.push_back({kr, kc});
+                else n_opp++;
+            }
+            if (n_own == 4 && n_opp == 0 && (int)empties.size() == 2) {
+                for (auto& e : empties) {
+                    if (std::find(blocks.begin(), blocks.end(), e) == blocks.end())
+                        blocks.push_back(e);
+                }
+            }
+        }
+    }
+    return blocks;
+}
+
+static int vct_rec(const Board& b, int attacker, int ply) {
+    if (time_up_flag || ply >= VCT_MAX_PLY) return -1;
+
+    // First try VCF (pure 5-threat chain, fully forced and cheap)
+    int vcf = vcf_rec(b, attacker, ply);
+    if (vcf >= 0) return vcf;
+
+    // Generate candidates: empty cells within radius 3 of any piece
+    bool visited[N][N] = {};
+    std::vector<std::pair<int,int>> cands;
+    for (int r = 0; r < N; r++) {
+        for (int c = 0; c < N; c++) {
+            if (b.cell[r][c] == 0) continue;
+            for (int dr = -3; dr <= 3; dr++) {
+                for (int dc = -3; dc <= 3; dc++) {
+                    int nr = r+dr, nc = c+dc;
+                    if (nr<0||nr>=N||nc<0||nc>=N) continue;
+                    if (b.cell[nr][nc] != 0) continue;
+                    if (!visited[nr][nc]) { visited[nr][nc]=true; cands.push_back({nr,nc}); }
+                }
+            }
+        }
+    }
+
+    // Try 4-threat (live-four) moves; skip 5-threats (already covered by vcf above)
+    for (auto& [r, c] : cands) {
+        if (time_up_flag) return -1;
+        auto gaps5 = vcf_gaps(b, r, c, attacker, (int8_t)attacker);
+        if (!gaps5.empty()) continue;
+
+        auto blocks4 = vct_4threat_blocks(b, r, c, attacker, (int8_t)attacker);
+        if (blocks4.empty()) continue;
+
+        Board after_atk = b.apply(r, c, false);
+        int atk_idx = r*N + c;
+
+        // Win only if attacker wins against EVERY possible defender block
+        bool wins_all = true;
+        for (auto& [br, bc] : blocks4) {
+            if (time_up_flag) return -1;
+            if (after_atk.cell[br][bc] != 0) continue;
+            Board after_blk = after_atk.apply(br, bc, false);
+            if (vct_rec(after_blk, attacker, ply + 2) < 0) { wins_all = false; break; }
+        }
+        if (wins_all) return atk_idx;
+    }
+
+    return -1;
+}
+
+static int vct_search(const Board& b) { return vct_rec(b, b.player, 0); }
+
+// ── Alpha-beta negamax with TT + History ─────────────────────────────────────
 
 static inline void push_tt_best_front(std::vector<std::pair<int,Move>>& moves,
                                        int16_t tt_action) {
@@ -514,10 +780,27 @@ static int negamax(const Board& b, int depth, int ply, int alpha, int beta) {
     int16_t best_action = -1;
     int     pidx = (b.player == 1) ? 0 : 1;
 
-    for (auto& [sc, m] : moves) {
+    for (int mi = 0; mi < (int)moves.size(); mi++) {
         if (time_up_flag) break;
+        auto& [sc, m] = moves[mi];
         Board nx  = b.apply(m.r, m.c, m.is_str);
-        int   val = -negamax(nx, depth - 1, ply + 1, -beta, -alpha);
+
+        // LMR: late moves (ranked 4+) at depth>=3 get depth reduced by 1-2.
+        // Skip reduction for: captures (strong on opp-reg), high-scored (fork/4+).
+        int val;
+        bool is_capture  = m.is_str && b.opp_reg(m.r, m.c);
+        bool is_critical = (sc >= S_4);
+        // Threat extension: extend by 1 ply for critical/capture moves near horizon.
+        // ply<=14 cap prevents cascading extensions on already-deep paths.
+        int ext = ((is_critical || is_capture) && depth <= 2 && ply <= 14) ? 1 : 0;
+        if (depth >= 3 && mi >= 4 && !is_capture && !is_critical) {
+            int R = (mi >= 8) ? 2 : 1;
+            val = -negamax(nx, depth - 1 - R, ply + 1, -alpha - 1, -alpha);
+            if (!time_up_flag && val > alpha)
+                val = -negamax(nx, depth - 1, ply + 1, -beta, -alpha);
+        } else {
+            val = -negamax(nx, depth - 1 + ext, ply + 1, -beta, -alpha);
+        }
         if (time_up_flag) break;
         if (val > best) {
             best = val;
@@ -563,6 +846,8 @@ public:
         search_deadline = std::chrono::steady_clock::now() + std::chrono::hours(24);
         time_up_flag = false;
         eval_counter = 0;
+        int vcf_idx = vcf_search(b);
+        if (vcf_idx >= 0) return vcf_idx;
         return search_at_depth(b, depth, -S_WIN*2, S_WIN*2, nullptr);
     }
 
@@ -587,6 +872,12 @@ public:
                 auto& m0 = cands[0].second;
                 best_idx = m0.is_str ? (NN + m0.r*N + m0.c) : (m0.r*N + m0.c);
             }
+        }
+
+        // VCF pre-search: if forced win sequence exists, return immediately
+        {
+            int vcf_idx = vcf_search(b);
+            if (vcf_idx >= 0) return vcf_idx;
         }
 
         // Iterative deepening with aspiration windows
@@ -636,6 +927,7 @@ private:
         b.strong[0]  = strong_b;
         b.strong[1]  = strong_w;
         b.zhash      = compute_initial_hash(b);
+        compute_initial_scores(b);
         return b;
     }
 

@@ -31,7 +31,7 @@ os.environ.setdefault("MKL_NUM_THREADS", "2")
 
 from connect6s.config import Config
 from connect6s.config_large import ConfigLarge
-from connect6s.game import GameState
+from connect6s.game import GameState, BOARD_SIZE
 from connect6s.heuristic import find_forced_move
 from connect6s.heuristic_agent import HeuristicAgent
 from connect6s.mcts import MCTS
@@ -69,6 +69,120 @@ def rebuild_from_moves(moves: list) -> GameState:
     return state
 
 
+# Board-char → signed int8 (black>0, white<0; |2|=strong). Matches GameState encoding.
+_CHAR2CELL = {".": 0, "b": 1, "B": 2, "w": -1, "W": -2}
+_DIRS4 = [(0, 1), (1, 0), (1, 1), (1, -1)]
+
+
+def _decode_compact(board_compact: str, board_size) -> list:
+    """Decode 'board_compact' string into 2D char board (template fallback)."""
+    try:
+        size = int(board_size)
+    except (TypeError, ValueError):
+        size = BOARD_SIZE
+    if size <= 0:
+        size = BOARD_SIZE
+    text = str(board_compact or "")
+    return [[text[r * size + c] if r * size + c < len(text) else "."
+             for c in range(size)] for r in range(size)]
+
+
+class SnapshotState:
+    """Duck-typed GameState built from a live board snapshot.
+
+    Fallback for when 'move_history' is absent (non-documented field).
+    Implements only the interface used by find_forced_move, HeuristicAgent,
+    and ArenaBot._pick_and_send — NOT a full game engine.
+    """
+
+    def __init__(self, board2d, current_player, move_count, strong_pieces):
+        n = BOARD_SIZE
+        self.board = np.zeros((n, n), dtype=np.int8)
+        for r in range(min(n, len(board2d))):
+            row = board2d[r]
+            for c in range(min(n, len(row))):
+                self.board[r, c] = _CHAR2CELL.get(row[c], 0)
+        self.current_player = current_player          # +1 black, -1 white
+        self.move_count     = move_count
+        self.strong_pieces  = strong_pieces           # {1: black_cnt, -1: white_cnt}
+        self.game_over      = self._detect_game_over()
+
+    def _detect_game_over(self) -> bool:
+        n = BOARD_SIZE
+        for r in range(n):
+            for c in range(n):
+                v = int(self.board[r, c])
+                if v == 0:
+                    continue
+                sign = 1 if v > 0 else -1
+                for dr, dc in _DIRS4:
+                    cnt = 1
+                    rr, cc = r + dr, c + dc
+                    while 0 <= rr < n and 0 <= cc < n and (int(self.board[rr, cc]) > 0) == (sign > 0) and self.board[rr, cc] != 0:
+                        cnt += 1
+                        if cnt >= 6:
+                            return True
+                        rr += dr
+                        cc += dc
+        return bool(not np.any(self.board == 0))
+
+    def get_observation(self) -> np.ndarray:
+        p = self.current_player
+        obs = np.zeros((6, BOARD_SIZE, BOARD_SIZE), dtype=np.float32)
+        obs[0] = (self.board ==  p).astype(np.float32)
+        obs[1] = (self.board == 2 * p).astype(np.float32)
+        obs[2] = (self.board == -p).astype(np.float32)
+        obs[3] = (self.board == -2 * p).astype(np.float32)
+        obs[4] = float(self.strong_pieces[p])
+        obs[5] = float(self.strong_pieces[-p])
+        return obs
+
+    def get_legal_moves(self):
+        p = self.current_player
+        has_strong = self.strong_pieces[p] > 0
+        moves = []
+        for r in range(BOARD_SIZE):
+            for c in range(BOARD_SIZE):
+                cell = int(self.board[r, c])
+                if cell == 0:
+                    moves.append((r, c, False))
+                    if has_strong:
+                        moves.append((r, c, True))
+                elif has_strong and abs(cell) == 1:
+                    moves.append((r, c, True))
+        return moves
+
+    def index_to_action(self, idx):
+        base = BOARD_SIZE * BOARD_SIZE
+        if idx >= base:
+            return (idx - base) // BOARD_SIZE, (idx - base) % BOARD_SIZE, True
+        return idx // BOARD_SIZE, idx % BOARD_SIZE, False
+
+
+def rebuild_from_board(room: dict, my_player_id) -> SnapshotState | None:
+    """Build SnapshotState from the documented live board fields."""
+    board2d = room.get("board")
+    if not isinstance(board2d, list):
+        board2d = _decode_compact(room.get("board_compact"), room.get("board_size"))
+    if not board2d:
+        return None
+
+    # Player to move (GameState sign): color int 1=black→+1, 2=white→-1
+    pc   = room.get("player_colors") or {}
+    turn = room.get("turn_info") or {}
+    turn_pid = turn.get("player_id", my_player_id)
+    turn_color = pc.get(str(turn_pid))
+    cur = 1 if turn_color == 1 else (-1 if turn_color == 2 else 1)
+
+    # strong_pieces_available keyed by color int: "1"=black, "2"=white
+    avail = room.get("strong_pieces_available") or {}
+    strong = {1:  int(avail.get("1", 0) or 0),
+              -1: int(avail.get("2", 0) or 0)}
+
+    move_count = int(room.get("move_count", 0) or 0)
+    return SnapshotState(board2d, cur, move_count, strong)
+
+
 # ── SSE stream parser ─────────────────────────────────────────────────────────
 def iter_sse(response):
     """Yield (event_name, data_dict) from an SSE response."""
@@ -104,6 +218,9 @@ class ArenaBot:
         self._last_move_key: str | None = None
         self._last_ready_key: str | None = None
         self._last_bid_key: str | None = None
+        self._logged_game_over: set = set()
+        self._game_color: dict = {}   # game_id -> my color int (1=black,2=white)
+        self._warned_board_fallback = False
         self._stop = threading.Event()
 
     # ── Low-level HTTP ────────────────────────────────────────────────────────
@@ -230,30 +347,52 @@ class ArenaBot:
             except Exception as e2:
                 log.error(f"Fallback also failed: {e2!r}")
 
+    # ── Template-aligned field helpers ─────────────────────────────────────────
+    @staticmethod
+    def _seated_username(room: dict, seat: str):
+        seat_key = "1" if seat == "black" else "2"
+        return (room.get("seated_usernames") or {}).get(seat_key)
+
+    def _find_my_player_id(self, room: dict):
+        for pid, uname in (room.get("player_usernames") or {}).items():
+            if uname == self.username:
+                return int(pid)
+        if self._seated_username(room, "black") == self.username:
+            return 1
+        if self._seated_username(room, "white") == self.username:
+            return 2
+        return None
+
+    def _current_seat(self, room: dict):
+        if self._seated_username(room, "black") == self.username:
+            return "black"
+        if self._seated_username(room, "white") == self.username:
+            return "white"
+        return None
+
     # ── Snapshot handler ──────────────────────────────────────────────────────
     def _handle_snapshot(self, room: dict):
-        # Determine my seat
-        su = room.get("seated_usernames", {})
-        if su.get("1") == self.username:
-            self.my_player_id = 1
-        elif su.get("2") == self.username:
-            self.my_player_id = 2
-        else:
-            self.my_player_id = None
+        self.my_player_id = self._find_my_player_id(room)
 
-        # Take an empty seat if available (black=P1=key"1", white=P2=key"2")
-        if self.my_player_id is None:
-            order = ["black", "white"]
-            if BOT_COLOR == "white":
-                order = ["white", "black"]
-            seat_key = {"black": "1", "white": "2"}
+        # Take an empty seat if not seated yet
+        if self._current_seat(room) not in ("black", "white"):
+            order = ["white", "black"] if BOT_COLOR == "white" else ["black", "white"]
             for color in order:
-                if su.get(seat_key[color]) is None:
+                if self._seated_username(room, color) is None:
                     self._seat(color)
                     break
             return
 
+        if self.my_player_id is None:
+            return
+
         pid = str(self.my_player_id)
+
+        # Track my color for this game while room is internally consistent
+        game_id = room.get("current_game_id", "")
+        my_color = (room.get("player_colors") or {}).get(pid)
+        if my_color is not None and game_id:
+            self._game_color[game_id] = my_color
 
         # Ready phase
         if room.get("awaiting_player_confirmation"):
@@ -266,27 +405,38 @@ class ArenaBot:
                     self._last_ready_key = ready_key
                     self._ready()
 
-        # Rebuild game state from authoritative move history
+        # Rebuild game state. Primary: move_history (exact). Fallback: live board.
         moves = room.get("move_history") or []
         try:
-            self.game_state = rebuild_from_moves(moves)
+            if moves:
+                self.game_state = rebuild_from_moves(moves)
+            else:
+                self.game_state = rebuild_from_board(room, self.my_player_id)
+                if self.game_state is not None and not self._warned_board_fallback:
+                    self._warned_board_fallback = True
+                    log.warning("move_history absent — using live-board fallback")
         except Exception as e:
             log.error(f"State rebuild failed: {e}")
             self.game_state = None
 
-        # Log game result when game ends
+        # Log game result when game ends (once per game)
         if self.game_state and self.game_state.game_over:
-            winner = room.get("winner") or room.get("result") or "?"
-            my_color = "black" if self.my_player_id == 1 else "white"
-            log.info(f"[GAME OVER] winner={winner} I_am={my_color}(p{self.my_player_id}) moves={len(moves)}")
-            # Log full move history to diagnose opponent strategy
-            my_pid = self.my_player_id
-            for i, m in enumerate(moves):
-                who = "ME  " if (i % 2 == 0) == (my_pid == 1) else "OPP "
-                coords = m.get("coords") or []
-                r_str = coords[0] if len(coords) > 0 else "?"
-                c_str = coords[1] if len(coords) > 1 else "?"
-                log.info(f"  [HIST] move={i} {who} ({r_str},{c_str}) strong={m.get('strong',False)}")
+            if game_id not in self._logged_game_over:
+                self._logged_game_over.add(game_id)
+                winner = room.get("winner") or room.get("result") or "?"
+                # color captured during play (stale-proof). int: 1=black, 2=white
+                color_int = self._game_color.get(game_id)
+                color_name = {1: "black", 2: "white"}.get(color_int, "?")
+                i_am_black = (color_int == 1)
+                log.info(f"[GAME OVER] winner={winner} "
+                         f"I_am={color_name}(p{self.my_player_id}) moves={len(moves)}")
+                for i, m in enumerate(moves):
+                    # black moves at even indices (black moves first)
+                    who = "ME  " if (i % 2 == 0) == i_am_black else "OPP "
+                    coords = m.get("coords") or []
+                    r_str = coords[0] if len(coords) > 0 else "?"
+                    c_str = coords[1] if len(coords) > 1 else "?"
+                    log.info(f"  [HIST] move={i} {who} ({r_str},{c_str}) strong={m.get('strong',False)}")
 
         # Move phase
         if room.get("awaiting_move") and self.game_state:

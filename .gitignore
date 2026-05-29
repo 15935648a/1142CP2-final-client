@@ -17,3 +17,4 @@ build/
 # Only keep best.pt; exclude all other checkpoints
 models/*.pt
 !models/best.pt
+arena.log
