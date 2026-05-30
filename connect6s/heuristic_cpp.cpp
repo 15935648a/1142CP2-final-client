@@ -497,6 +497,16 @@ static std::vector<std::pair<int,Move>> gen_moves(const Board& b) {
                     // Chain-break bonus: graduated by opponent line strength
                     if      (def >= S_4) bonus += S_4 * 3;   // disrupts 4+: 30K
                     else if (def >= S_3) bonus += S_3 * 3;   // disrupts 3+: 3K (new)
+                    // Line-split bonus: capturing a piece flanked by opp pieces on both sides
+                    // in any direction splits the line into two isolated segments — far more
+                    // disruptive than shortening from an endpoint (eval count can't see this).
+                    for (int d = 0; d < 4; d++) {
+                        int r1 = r + DR4[d], c1 = c + DC4[d];
+                        int r2 = r - DR4[d], c2 = c - DC4[d];
+                        bool n1 = r1>=0&&r1<N&&c1>=0&&c1<N && b.opp_reg(r1,c1);
+                        bool n2 = r2>=0&&r2<N&&c2>=0&&c2<N && b.opp_reg(r2,c2);
+                        if (n1 && n2) bonus += S_3 * 5;
+                    }
                     moves.push_back({make_score(atk, 2*def, bonus), {r, c, true}});
                 } else if (b.my_reg(r, c) && near[r][c]) {
                     // Bug fix: include atk (upgrade makes own piece uncapturable)
@@ -628,6 +638,45 @@ static int find_block_upgrade(const Board& b) {
     }
     if (best_r < 0) return -1;
     return NN + best_r*N + best_c;  // upgrade our regular → strong
+}
+
+// Detect opp's longest live consecutive run of regular pieces (≥ 3).
+// Capturing the center splits the line into isolated segments.
+// The IDA heuristic misses this: our piece placed between two opp pieces makes all
+// shared windows "mixed" (scoring 0 for us), so pure eval prefers endpoint captures.
+static int find_line_split(const Board& b) {
+    if (b.strong[b.pidx()] <= 0) return -1;
+    int best_r = -1, best_c = -1, best_len = 3;  // require run >= 4
+    for (int r = 0; r < N; r++) {
+        for (int c = 0; c < N; c++) {
+            for (int d = 0; d < 4; d++) {
+                // Only process the start of a run
+                int pr = r - DR4[d], pc = c - DC4[d];
+                if (pr>=0&&pr<N&&pc>=0&&pc<N && b.opp_reg(pr,pc)) continue;
+                if (!b.opp_reg(r, c)) continue;
+                int run_len = 0;
+                while (true) {
+                    int nr = r + DR4[d]*run_len, nc = c + DC4[d]*run_len;
+                    if (nr<0||nr>=N||nc<0||nc>=N) break;
+                    if (!b.opp_reg(nr, nc)) break;
+                    run_len++;
+                }
+                if (run_len <= best_len) continue;
+                // Only act on live runs (at least one open end)
+                int er = r + DR4[d]*run_len, ec = c + DC4[d]*run_len;
+                int br = r - DR4[d], bc = c - DC4[d];
+                bool open_end = (er>=0&&er<N&&ec>=0&&ec<N && b.cell[er][ec]==0)
+                             || (br>=0&&br<N&&bc>=0&&bc<N && b.cell[br][bc]==0);
+                if (!open_end) continue;
+                best_len = run_len;
+                int mid = run_len / 2;
+                best_r = r + DR4[d]*mid;
+                best_c = c + DC4[d]*mid;
+            }
+        }
+    }
+    if (best_r < 0) return -1;
+    return NN + best_r*N + best_c;
 }
 
 static int vcf_rec(const Board& b, int attacker, int ply) {
@@ -988,6 +1037,15 @@ public:
         {
             int up = find_block_upgrade(b);
             if (up >= 0) return up;
+        }
+
+        // Line-split: capture center of opp's longest live 3+ in-a-row.
+        // IDA heuristic can't see this — placing our piece between two opp pieces
+        // makes all shared windows "mixed" (0 score), so pure eval wrongly prefers
+        // endpoint captures which leave opp with a connected pair to extend.
+        {
+            int ls = find_line_split(b);
+            if (ls >= 0) return ls;
         }
 
         // Iterative deepening with aspiration windows
