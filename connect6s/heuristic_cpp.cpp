@@ -457,8 +457,13 @@ static std::vector<std::pair<int,Move>> gen_moves(const Board& b) {
 
             if (b.can_strong_at(r, c)) {
                 if (v == 0 && near[r][c]) {
-                    int atk = cell_value(b, r, c,  b.player);
-                    int def = cell_value(b, r, c, -b.player);
+                    // Use actual eval diff: partial block of 4-in-a-row shouldn't
+                    // score S_5 when the line remains threatening from the other end.
+                    Board after_blk = b.apply(r, c, true);
+                    int opp_pi_b = (b.player > 0) ? 1 : 0;
+                    int my_pi_b  = 1 - opp_pi_b;
+                    int def = std::max(0, b.score[opp_pi_b] - after_blk.score[opp_pi_b]);
+                    int atk = std::max(0, after_blk.score[my_pi_b] - b.score[my_pi_b]);
                     int bonus = strong_penalty + hist;  // strong penalty: waived on last
                     if (atk < S_WIN && def < S_WIN) {
                         if (count_fork_directions(b, r, c, b.player, 4) >= 2)
@@ -468,10 +473,16 @@ static std::vector<std::pair<int,Move>> gen_moves(const Board& b) {
                     }
                     moves.push_back({make_score(atk, def, bonus), {r, c, true}});
                 } else if (b.opp_reg(r, c)) {
-                    // Strong capture: our uncapturable piece replaces opponent's piece.
-                    // Boost atk ×3/2 (strong piece can't be recaptured).
-                    int atk = cell_value(b, r, c,  b.player) * 3 / 2;
-                    int def = cell_value(b, r, c, -b.player);
+                    // Strong capture: use actual eval diff for accurate disruption.
+                    // cell_value() only measures "new piece gain", not "existing piece removal".
+                    // Board::apply() incremental update is O(64 patches) — cheap per candidate.
+                    Board after_cap = b.apply(r, c, true);
+                    int opp_pi = (b.player > 0) ? 1 : 0;
+                    int my_pi  = 1 - opp_pi;
+                    int disruption = std::max(0, b.score[opp_pi] - after_cap.score[opp_pi]);
+                    int gain       = std::max(0, after_cap.score[my_pi] - b.score[my_pi]);
+                    int atk = gain * 3 / 2;
+                    int def = disruption;
                     int bonus = hist;
                     if (atk < S_WIN && def < S_WIN) {
                         // Unblockable fork: strong piece fork is lethal (×1.5 bonus)
@@ -954,6 +965,15 @@ public:
             ov.player = -b.player;                      // pretend opponent to move
             if (vcf_rec(ov, -b.player, 0) >= 0) {
                 auto cands = gen_moves(b);              // sorted best-first
+                // Prefer captures: breaking a line is stronger than blocking one end.
+                // (Blocking one end of double-open 4-in-a-row leaves mirror threat alive.)
+                for (auto& [sc, m] : cands) {
+                    if (!m.is_str || !b.opp_reg(m.r, m.c)) continue;
+                    Board after = b.apply(m.r, m.c, m.is_str);
+                    if (vcf_rec(after, after.player, 0) >= 0) continue;
+                    return NN + m.r*N + m.c;
+                }
+                // Fall back: any move that breaks opp VCF
                 for (auto& [sc, m] : cands) {
                     Board after = b.apply(m.r, m.c, m.is_str);  // toggles to opponent
                     if (vcf_rec(after, after.player, 0) >= 0) continue;  // still loses
