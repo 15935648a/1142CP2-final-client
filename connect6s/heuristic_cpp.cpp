@@ -584,6 +584,40 @@ static bool can_win_now(const Board& b, int p) {
     return false;
 }
 
+// Rush-defense: opponent is building a line through our SINGLE, capturable
+// regular block. If both sides hold a strong piece, that block is illusory —
+// the opponent will strong-capture it (the loss pattern the offense-tuned eval
+// underrates, beyond the search horizon). Find the most-developed such 6-window
+// (opp >= 3 own; the only non-opponent cell is our one regular; no own strong)
+// and return the move that upgrades OUR regular there to strong (uncapturable).
+// Returns the strong-move index, or -1. Defense-only — does not touch the eval.
+static int find_block_upgrade(const Board& b) {
+    int me = b.player, opp = -me;
+    if (b.strong[(me  > 0) ? 0 : 1] <= 0) return -1;  // we need strong to upgrade
+    if (b.strong[(opp > 0) ? 0 : 1] <= 0) return -1;  // opp needs strong to capture
+    int best_r = -1, best_c = -1, best_opp = 2;        // require opp_own >= 3
+    for (int r = 0; r < N; r++)
+    for (int c = 0; c < N; c++)
+    for (int d = 0; d < 4; d++) {
+        int er = r + DR4[d]*5, ec = c + DC4[d]*5;
+        if (er < 0 || er >= N || ec < 0 || ec >= N) continue;
+        int n_opp = 0, my_reg = 0, my_str = 0, mr = -1, mc = -1;
+        for (int j = 0; j < 6; j++) {
+            int rr = r + DR4[d]*j, cc = c + DC4[d]*j;
+            int8_t v = b.cell[rr][cc];
+            if (v == 0) continue;
+            if (Board::owns(v, opp)) n_opp++;
+            else if (std::abs((int)v) == 2) my_str++;       // own strong already
+            else { my_reg++; mr = rr; mc = cc; }            // own regular block
+        }
+        // window = opp pieces + exactly one of our regulars + empties (no own strong)
+        if (my_str != 0 || my_reg != 1) continue;
+        if (n_opp > best_opp) { best_opp = n_opp; best_r = mr; best_c = mc; }
+    }
+    if (best_r < 0) return -1;
+    return NN + best_r*N + best_c;  // upgrade our regular → strong
+}
+
 static int vcf_rec(const Board& b, int attacker, int ply) {
     if (ply >= VCF_MAX_PLY) return -1;
 
@@ -926,6 +960,13 @@ public:
                 }
                 // No refutation exists → genuinely lost; fall through to IDA.
             }
+        }
+
+        // Rush-defense: upgrade an illusory (capturable) block when the opponent
+        // is rushing a line through it. Defense-only pre-check.
+        {
+            int up = find_block_upgrade(b);
+            if (up >= 0) return up;
         }
 
         // Iterative deepening with aspiration windows
