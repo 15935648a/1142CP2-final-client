@@ -483,9 +483,10 @@ static std::vector<std::pair<int,Move>> gen_moves(const Board& b) {
                     // High-threat line bonus: capture forms 5-in-a-row or 4-in-a-row
                     if      (atk >= S_5) bonus += S_5;
                     else if (atk >= S_4) bonus += S_4 * 5;
-                    // Chain-break bonus: disrupting opponent's 4+ threat
-                    if (def >= S_4) bonus += S_4;
-                    moves.push_back({make_score(atk, 3*def/2, bonus), {r, c, true}});
+                    // Chain-break bonus: graduated by opponent line strength
+                    if      (def >= S_4) bonus += S_4 * 3;   // disrupts 4+: 30K
+                    else if (def >= S_3) bonus += S_3 * 3;   // disrupts 3+: 3K (new)
+                    moves.push_back({make_score(atk, 2*def, bonus), {r, c, true}});
                 } else if (b.my_reg(r, c) && near[r][c]) {
                     // Bug fix: include atk (upgrade makes own piece uncapturable)
                     int atk = cell_value(b, r, c,  b.player);
